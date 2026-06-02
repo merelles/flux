@@ -35,7 +35,6 @@ Available today:
 - `PostgresRepository<T>` inside the current `flux` crate
 - `find_by_id`
 - `find_all`
-- `find_all_with_filter`
 - `insert`
 - `update`
 - `save`

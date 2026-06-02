@@ -21,15 +21,6 @@ pub trait ReadRepository<T: Entity>: Send + Sync {
         page: PageRequest<T::Id>,
     ) -> Result<Page<T, T::Id>>;
 
-    #[deprecated(
-        note = "use find_page_with_filter for bounded reads or UnboundedReadRepository for explicit unbounded reads"
-    )]
-    async fn find_all_with_filter(
-        &self,
-        filter: GenericFilter<T>,
-        page: PageRequest<T::Id>,
-    ) -> Result<Page<T, T::Id>>;
-
     async fn exists(&self, id: &T::Id) -> Result<bool>;
 
     async fn count(&self) -> Result<u64>;

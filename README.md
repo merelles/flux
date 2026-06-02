@@ -106,7 +106,7 @@ flux          -> no database driver
 Read flow:
 
 ```text
-repo.find_all_with_filter(filter, page)
+repo.find_page_with_filter(filter, page)
       |
       v
 GenericFilter AST + PageRequest
@@ -299,7 +299,7 @@ let filter = GenericFilter::<Product>::new()
     .order_by("price", OrderDirection::Asc);
 
 let page = repo
-    .find_all_with_filter(filter, PageRequest::cursor(50, None))
+    .find_page_with_filter(filter, PageRequest::cursor(50, None))
     .await?;
 ```
 
@@ -547,7 +547,7 @@ let filter = GenericFilter::<Customer>::new()
     .eq("name", "Alice");
 
 let page = repo
-    .find_all_with_filter(filter, PageRequest::cursor(50, None))
+    .find_page_with_filter(filter, PageRequest::cursor(50, None))
     .await?;
 ```
 

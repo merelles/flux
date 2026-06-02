@@ -55,14 +55,6 @@ impl ReadRepository<Product> for ProductReadRepository {
         self.find_page(page).await
     }
 
-    async fn find_all_with_filter(
-        &self,
-        filter: GenericFilter<Product>,
-        page: PageRequest<Uuid>,
-    ) -> Result<Page<Product, Uuid>> {
-        self.find_page_with_filter(filter, page).await
-    }
-
     async fn exists(&self, id: &Uuid) -> Result<bool> {
         Ok(self.products.iter().any(|product| product.id() == id))
     }

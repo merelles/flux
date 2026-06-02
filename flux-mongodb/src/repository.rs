@@ -635,14 +635,6 @@ where
         self.query_page(rendered.filter, rendered.sort, page).await
     }
 
-    async fn find_all_with_filter(
-        &self,
-        filter: GenericFilter<T>,
-        page: PageRequest<T::Id>,
-    ) -> Result<Page<T, T::Id>> {
-        self.find_page_with_filter(filter, page).await
-    }
-
     async fn exists(&self, id: &T::Id) -> Result<bool> {
         let filter = id_filter::<T>(id)?;
         let count = self
