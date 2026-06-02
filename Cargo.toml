@@ -1,0 +1,9 @@
+[workspace]
+members = ["flux", "flux-derive"]
+resolver = "2"
+
+[workspace.package]
+authors = ["leonardo merelles <merellesleonardo@gmail.com>"]
+homepage = "https://github.com/merelles/flux"
+license = "MIT"
+repository = "https://github.com/merelles/flux"

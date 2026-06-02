@@ -1,0 +1,39 @@
+[package]
+name = "flux"
+version = "0.1.0"
+edition = "2021"
+authors.workspace = true
+homepage.workspace = true
+license.workspace = true
+description = "Generic repository pattern with support for multiple databases"
+repository.workspace = true
+
+[features]
+default = ["postgres"]
+
+# Database implementations
+postgres = ["dep:tokio-postgres"]
+sqlserver = ["dep:tiberius"]
+
+# All features for development
+all = ["postgres", "sqlserver"]
+
+[dependencies]
+# Core - always present
+async-trait = "0.1.87"
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "1"
+tokio = { version = "1", features = ["rt"] }
+dotenvy = "0.15"
+
+# PostgreSQL (feature - requerido por padrão)
+tokio-postgres = { version = "0.7", features = ["with-uuid-1", "with-chrono-0_4"], optional = true }
+
+# SQL Server (optional feature) - excellent choice tiberius!
+tiberius = { version = "0.11", optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"
+tokio = { version = "1", features = ["full"] }
+dotenv = "0.15"
+
