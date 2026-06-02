@@ -21,6 +21,9 @@ pub trait ReadRepository<T: Entity>: Send + Sync {
         page: PageRequest<T::Id>,
     ) -> Result<Page<T, T::Id>>;
 
+    #[deprecated(
+        note = "use find_page_with_filter for bounded reads or UnboundedReadRepository for explicit unbounded reads"
+    )]
     async fn find_all_with_filter(
         &self,
         filter: GenericFilter<T>,
@@ -191,6 +194,59 @@ where
         }
 
         Ok(())
+    }
+}
+
+#[async_trait]
+pub trait UnboundedReadRepository<T>: ReadRepository<T>
+where
+    T: Entity,
+{
+    async fn find_all_unbounded(&self) -> Result<Vec<T>>;
+
+    async fn find_all_unbounded_with_filter(&self, filter: GenericFilter<T>) -> Result<Vec<T>>;
+}
+
+#[async_trait]
+impl<T, R> UnboundedReadRepository<T> for R
+where
+    T: Entity + 'static,
+    R: ReadRepository<T> + Sync,
+{
+    async fn find_all_unbounded(&self) -> Result<Vec<T>> {
+        let mut items = Vec::new();
+        let mut after = None;
+
+        loop {
+            let page = self.find_page(PageRequest::cursor(1024, after)).await?;
+            after = page.next_cursor.clone();
+            items.extend(page.items);
+
+            if after.is_none() {
+                break;
+            }
+        }
+
+        Ok(items)
+    }
+
+    async fn find_all_unbounded_with_filter(&self, filter: GenericFilter<T>) -> Result<Vec<T>> {
+        let mut items = Vec::new();
+        let mut after = None;
+
+        loop {
+            let page = self
+                .find_page_with_filter(filter.clone(), PageRequest::cursor(1024, after))
+                .await?;
+            after = page.next_cursor.clone();
+            items.extend(page.items);
+
+            if after.is_none() {
+                break;
+            }
+        }
+
+        Ok(items)
     }
 }
 

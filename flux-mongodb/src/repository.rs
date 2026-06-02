@@ -1,4 +1,4 @@
-use std::{future::Future, marker::PhantomData, pin::Pin};
+use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use flux::{
@@ -11,6 +11,7 @@ use mongodb::{
     bson::{Bson, Document},
     ClientSession, Collection, Database,
 };
+use tokio::sync::Mutex;
 
 use crate::{entity::unsupported_id, render_filter_parts, MongoAggregate, MongoEntity, MongoId};
 
@@ -20,6 +21,7 @@ pub type MongoTransactionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> 
 
 pub struct MongoRepository<T: MongoEntity> {
     database: Database,
+    session: Option<Arc<Mutex<ClientSession>>>,
     _marker: PhantomData<T>,
 }
 
@@ -27,6 +29,7 @@ impl<T: MongoEntity> Clone for MongoRepository<T> {
     fn clone(&self) -> Self {
         Self {
             database: self.database.clone(),
+            session: self.session.clone(),
             _marker: PhantomData,
         }
     }
@@ -36,6 +39,15 @@ impl<T: MongoEntity> MongoRepository<T> {
     pub fn new(database: Database) -> Self {
         Self {
             database,
+            session: None,
+            _marker: PhantomData,
+        }
+    }
+
+    fn with_session(database: Database, session: Arc<Mutex<ClientSession>>) -> Self {
+        Self {
+            database,
+            session: Some(session),
             _marker: PhantomData,
         }
     }
@@ -75,6 +87,170 @@ impl<T: MongoEntity> MongoRepository<T> {
                 }
                 Err(error)
             }
+        }
+    }
+
+    async fn start_transaction_repository(&self) -> Result<Self> {
+        let mut session = self
+            .database
+            .client()
+            .start_session()
+            .await
+            .map_err(map_error)?;
+        session.start_transaction().await.map_err(map_error)?;
+        Ok(Self::with_session(
+            self.database.clone(),
+            Arc::new(Mutex::new(session)),
+        ))
+    }
+
+    async fn commit_transaction_repository(&self) -> Result<()> {
+        let session = self.session.as_ref().ok_or_else(|| {
+            RepositoryError::OperationFailed("missing Mongo transaction session".to_string())
+        })?;
+        let mut session = session.lock().await;
+        session.commit_transaction().await.map_err(map_error)
+    }
+
+    async fn rollback_transaction_repository(&self) -> Result<()> {
+        let session = self.session.as_ref().ok_or_else(|| {
+            RepositoryError::OperationFailed("missing Mongo transaction session".to_string())
+        })?;
+        let mut session = session.lock().await;
+        session.abort_transaction().await.map_err(map_error)
+    }
+
+    async fn insert_one_document(&self, document: Document) -> Result<()> {
+        if let Some(session) = &self.session {
+            let mut session = session.lock().await;
+            self.collection()
+                .insert_one(document)
+                .session(&mut *session)
+                .await
+                .map_err(map_error)?;
+        } else {
+            self.collection()
+                .insert_one(document)
+                .await
+                .map_err(map_error)?;
+        }
+        Ok(())
+    }
+
+    async fn insert_many_documents(&self, documents: Vec<Document>) -> Result<()> {
+        if let Some(session) = &self.session {
+            let mut session = session.lock().await;
+            self.collection()
+                .insert_many(documents)
+                .session(&mut *session)
+                .await
+                .map_err(map_error)?;
+        } else {
+            self.collection()
+                .insert_many(documents)
+                .await
+                .map_err(map_error)?;
+        }
+        Ok(())
+    }
+
+    async fn bulk_write_models(
+        &self,
+        models: Vec<mongodb::options::ReplaceOneModel>,
+    ) -> Result<mongodb::results::SummaryBulkWriteResult> {
+        let models = models
+            .into_iter()
+            .map(mongodb::options::WriteModel::ReplaceOne)
+            .collect::<Vec<_>>();
+
+        if let Some(session) = &self.session {
+            let mut session = session.lock().await;
+            self.database
+                .client()
+                .bulk_write(models)
+                .session(&mut *session)
+                .await
+                .map_err(map_error)
+        } else {
+            self.database
+                .client()
+                .bulk_write(models)
+                .await
+                .map_err(map_error)
+        }
+    }
+
+    async fn replace_one_document(
+        &self,
+        filter: Document,
+        document: Document,
+        upsert: bool,
+    ) -> Result<mongodb::results::UpdateResult> {
+        let collection = self.collection();
+        let action = collection.replace_one(filter, document).upsert(upsert);
+        if let Some(session) = &self.session {
+            let mut session = session.lock().await;
+            action.session(&mut *session).await.map_err(map_error)
+        } else {
+            action.await.map_err(map_error)
+        }
+    }
+
+    async fn delete_one_document(
+        &self,
+        filter: Document,
+    ) -> Result<mongodb::results::DeleteResult> {
+        if let Some(session) = &self.session {
+            let mut session = session.lock().await;
+            self.collection()
+                .delete_one(filter)
+                .session(&mut *session)
+                .await
+                .map_err(map_error)
+        } else {
+            self.collection()
+                .delete_one(filter)
+                .await
+                .map_err(map_error)
+        }
+    }
+
+    async fn delete_many_documents(
+        &self,
+        filter: Document,
+    ) -> Result<mongodb::results::DeleteResult> {
+        if let Some(session) = &self.session {
+            let mut session = session.lock().await;
+            self.collection()
+                .delete_many(filter)
+                .session(&mut *session)
+                .await
+                .map_err(map_error)
+        } else {
+            self.collection()
+                .delete_many(filter)
+                .await
+                .map_err(map_error)
+        }
+    }
+
+    async fn update_many_documents(
+        &self,
+        filter: Document,
+        update: Document,
+    ) -> Result<mongodb::results::UpdateResult> {
+        if let Some(session) = &self.session {
+            let mut session = session.lock().await;
+            self.collection()
+                .update_many(filter, update)
+                .session(&mut *session)
+                .await
+                .map_err(map_error)
+        } else {
+            self.collection()
+                .update_many(filter, update)
+                .await
+                .map_err(map_error)
         }
     }
 
@@ -298,11 +474,8 @@ impl<T: MongoEntity> MongoRepository<T> {
         let source_key = required_relation_part(metadata, metadata.source_key, "source_key")?;
         let mut filter = Document::new();
         filter.insert(source_key, entity_id_to_bson(source)?);
-        self.database
-            .collection::<Document>(join_table)
-            .delete_many(filter)
-            .await
-            .map_err(map_error)?;
+        delete_many_in_collection(&self.database, self.session.as_ref(), join_table, filter)
+            .await?;
         Ok(())
     }
 
@@ -333,11 +506,8 @@ impl<T: MongoEntity> MongoRepository<T> {
             filter.insert(target_key, Bson::Document(not_in));
         }
 
-        self.database
-            .collection::<Document>(join_table)
-            .delete_many(filter)
-            .await
-            .map_err(map_error)?;
+        delete_many_in_collection(&self.database, self.session.as_ref(), join_table, filter)
+            .await?;
         Ok(())
     }
 
@@ -380,11 +550,7 @@ impl<T: MongoEntity> MongoRepository<T> {
             models.push(model);
         }
 
-        self.database
-            .client()
-            .bulk_write(models)
-            .await
-            .map_err(map_error)?;
+        self.bulk_write_models(models).await?;
         Ok(())
     }
 
@@ -502,20 +668,15 @@ where
     T::Id: MongoId,
 {
     async fn insert(&self, entity: &T) -> Result<T> {
-        self.collection()
-            .insert_one(entity.to_document()?)
-            .await
-            .map_err(map_error)?;
+        self.insert_one_document(entity.to_document()?).await?;
         Ok(entity.clone())
     }
 
     async fn update(&self, entity: &T) -> Result<T> {
         let filter = id_filter::<T>(entity.id())?;
         let result = self
-            .collection()
-            .replace_one(filter, entity.to_document()?)
-            .await
-            .map_err(map_error)?;
+            .replace_one_document(filter, entity.to_document()?, false)
+            .await?;
         if result.matched_count == 0 {
             return Err(RepositoryError::NotFound);
         }
@@ -524,21 +685,14 @@ where
 
     async fn save(&self, entity: &T) -> Result<T> {
         let filter = id_filter::<T>(entity.id())?;
-        self.collection()
-            .replace_one(filter, entity.to_document()?)
-            .upsert(true)
-            .await
-            .map_err(map_error)?;
+        self.replace_one_document(filter, entity.to_document()?, true)
+            .await?;
         Ok(entity.clone())
     }
 
     async fn delete(&self, id: &T::Id) -> Result<bool> {
         let filter = id_filter::<T>(id)?;
-        let result = self
-            .collection()
-            .delete_one(filter)
-            .await
-            .map_err(map_error)?;
+        let result = self.delete_one_document(filter).await?;
         Ok(result.deleted_count > 0)
     }
 }
@@ -558,10 +712,7 @@ where
             .iter()
             .map(T::to_document)
             .collect::<Result<Vec<_>>>()?;
-        self.collection()
-            .insert_many(documents)
-            .await
-            .map_err(map_error)?;
+        self.insert_many_documents(documents).await?;
         Ok(entities.to_vec())
     }
 
@@ -571,12 +722,7 @@ where
         }
 
         let models = self.replace_models(entities, false)?;
-        let result = self
-            .database
-            .client()
-            .bulk_write(models)
-            .await
-            .map_err(map_error)?;
+        let result = self.bulk_write_models(models).await?;
 
         if result.matched_count < entities.len() as i64 {
             return Err(RepositoryError::NotFound);
@@ -591,11 +737,7 @@ where
         }
 
         let models = self.replace_models(entities, true)?;
-        self.database
-            .client()
-            .bulk_write(models)
-            .await
-            .map_err(map_error)?;
+        self.bulk_write_models(models).await?;
 
         Ok(entities.to_vec())
     }
@@ -613,11 +755,7 @@ where
         in_filter.insert("$in", Bson::Array(values));
         let mut filter = Document::new();
         filter.insert(T::id_field(), Bson::Document(in_filter));
-        let result = self
-            .collection()
-            .delete_many(filter)
-            .await
-            .map_err(map_error)?;
+        let result = self.delete_many_documents(filter).await?;
         Ok(result.deleted_count)
     }
 }
@@ -673,11 +811,7 @@ where
     {
         let mut filter = Document::new();
         filter.insert(field, entity_id_to_bson(value)?);
-        let result = self
-            .collection()
-            .delete_many(filter)
-            .await
-            .map_err(map_error)?;
+        let result = self.delete_many_documents(filter).await?;
         Ok(result.deleted_count)
     }
 }
@@ -695,26 +829,71 @@ where
     }
 
     async fn insert_graph(&self, aggregate: &A) -> Result<A> {
-        let saved = self.insert(aggregate).await?;
-        A::insert_relations(self, aggregate).await?;
+        let tx_repo = self.start_transaction_repository().await?;
+        let saved = match tx_repo.insert(aggregate).await {
+            Ok(saved) => saved,
+            Err(error) => {
+                tx_repo.rollback_transaction_repository().await?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = A::insert_relations(&tx_repo, aggregate).await {
+            tx_repo.rollback_transaction_repository().await?;
+            return Err(error);
+        }
+        tx_repo.commit_transaction_repository().await?;
         self.reload_all_relations(saved.id()).await
     }
 
     async fn update_graph(&self, aggregate: &A, mode: GraphSaveMode) -> Result<A> {
-        let saved = self.update(aggregate).await?;
-        A::update_relations(self, aggregate, mode).await?;
+        let tx_repo = self.start_transaction_repository().await?;
+        let saved = match tx_repo.update(aggregate).await {
+            Ok(saved) => saved,
+            Err(error) => {
+                tx_repo.rollback_transaction_repository().await?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = A::update_relations(&tx_repo, aggregate, mode).await {
+            tx_repo.rollback_transaction_repository().await?;
+            return Err(error);
+        }
+        tx_repo.commit_transaction_repository().await?;
         self.reload_all_relations(saved.id()).await
     }
 
     async fn save_graph(&self, aggregate: &A, mode: GraphSaveMode) -> Result<A> {
-        let saved = self.save(aggregate).await?;
-        A::update_relations(self, aggregate, mode).await?;
+        let tx_repo = self.start_transaction_repository().await?;
+        let saved = match tx_repo.save(aggregate).await {
+            Ok(saved) => saved,
+            Err(error) => {
+                tx_repo.rollback_transaction_repository().await?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = A::update_relations(&tx_repo, aggregate, mode).await {
+            tx_repo.rollback_transaction_repository().await?;
+            return Err(error);
+        }
+        tx_repo.commit_transaction_repository().await?;
         self.reload_all_relations(saved.id()).await
     }
 
     async fn delete_graph(&self, id: &A::Id) -> Result<bool> {
-        A::delete_relations(self, id).await?;
-        self.delete(id).await
+        let tx_repo = self.start_transaction_repository().await?;
+        if let Err(error) = A::delete_relations(&tx_repo, id).await {
+            tx_repo.rollback_transaction_repository().await?;
+            return Err(error);
+        }
+        let deleted = match tx_repo.delete(id).await {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                tx_repo.rollback_transaction_repository().await?;
+                return Err(error);
+            }
+        };
+        tx_repo.commit_transaction_repository().await?;
+        Ok(deleted)
     }
 }
 
@@ -788,11 +967,7 @@ where
         filter.insert(C::id_field(), Bson::Document(not_in));
     }
 
-    repository
-        .collection()
-        .delete_many(filter)
-        .await
-        .map_err(map_error)?;
+    repository.delete_many_documents(filter).await?;
     Ok(())
 }
 
@@ -849,12 +1024,27 @@ where
     unset.insert(field, "");
     let mut update = Document::new();
     update.insert("$unset", Bson::Document(unset));
-    repository
-        .collection()
-        .update_many(filter, update)
-        .await
-        .map_err(map_error)?;
+    repository.update_many_documents(filter, update).await?;
     Ok(())
+}
+
+async fn delete_many_in_collection(
+    database: &Database,
+    session: Option<&Arc<Mutex<ClientSession>>>,
+    collection_name: &str,
+    filter: Document,
+) -> Result<mongodb::results::DeleteResult> {
+    let collection = database.collection::<Document>(collection_name);
+    if let Some(session) = session {
+        let mut session = session.lock().await;
+        collection
+            .delete_many(filter)
+            .session(&mut *session)
+            .await
+            .map_err(map_error)
+    } else {
+        collection.delete_many(filter).await.map_err(map_error)
+    }
 }
 
 fn foreign_key_filter<K>(field: &str, value: &K) -> Result<Document>
@@ -882,10 +1072,20 @@ fn entity_id_to_bson<I: EntityId>(id: &I) -> Result<Bson> {
         Ok(Bson::ObjectId(value.0))
     } else if let Some(value) = any.downcast_ref::<String>() {
         Ok(Bson::String(value.clone()))
+    } else if let Some(value) = any.downcast_ref::<i16>() {
+        Ok(Bson::Int32(i32::from(*value)))
     } else if let Some(value) = any.downcast_ref::<i32>() {
         Ok(Bson::Int32(*value))
     } else if let Some(value) = any.downcast_ref::<i64>() {
         Ok(Bson::Int64(*value))
+    } else if let Some(value) = any.downcast_ref::<u16>() {
+        Ok(Bson::Int32(i32::from(*value)))
+    } else if let Some(value) = any.downcast_ref::<u32>() {
+        Ok(Bson::Int64(i64::from(*value)))
+    } else if let Some(value) = any.downcast_ref::<u64>() {
+        Ok(Bson::Int64(i64::try_from(*value).map_err(|_| {
+            RepositoryError::InvalidData(format!("u64 value exceeds i64 range: {value}"))
+        })?))
     } else if let Some(value) = any.downcast_ref::<uuid::Uuid>() {
         Ok(Bson::String(value.to_string()))
     } else {

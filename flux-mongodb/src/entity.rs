@@ -44,6 +44,12 @@ impl MongoId for String {
     }
 }
 
+impl MongoId for i16 {
+    fn to_bson(&self) -> Result<Bson> {
+        Ok(Bson::Int32(i32::from(*self)))
+    }
+}
+
 impl MongoId for i32 {
     fn to_bson(&self) -> Result<Bson> {
         Ok(Bson::Int32(*self))
@@ -53,6 +59,26 @@ impl MongoId for i32 {
 impl MongoId for i64 {
     fn to_bson(&self) -> Result<Bson> {
         Ok(Bson::Int64(*self))
+    }
+}
+
+impl MongoId for u16 {
+    fn to_bson(&self) -> Result<Bson> {
+        Ok(Bson::Int32(i32::from(*self)))
+    }
+}
+
+impl MongoId for u32 {
+    fn to_bson(&self) -> Result<Bson> {
+        Ok(Bson::Int64(i64::from(*self)))
+    }
+}
+
+impl MongoId for u64 {
+    fn to_bson(&self) -> Result<Bson> {
+        i64::try_from(*self).map(Bson::Int64).map_err(|_| {
+            RepositoryError::InvalidData(format!("u64 value exceeds i64 range: {self}"))
+        })
     }
 }
 
