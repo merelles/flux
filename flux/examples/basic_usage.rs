@@ -1,17 +1,9 @@
-//! Example: Using PostgresRepository
-//!
-//! This demonstrates how to use the new PostgresRepository with a custom entity.
-//!
-//! Note: This example requires a running PostgreSQL database.
+use flux::{
+    Entity, GenericFilter, OrderDirection, Page, PageRequest, ReadRepository, RepositoryError,
+    Result, Uuid,
+};
 
-use std::sync::Arc;
-
-use flux::{Entity, PostgresRepository};
-use tokio_postgres::NoTls;
-use uuid::Uuid;
-
-/// Simple Product entity
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Product {
     pub product_oid: Uuid,
     pub name: String,
@@ -19,38 +11,10 @@ pub struct Product {
 }
 
 impl Entity for Product {
-    fn table_name() -> &'static str {
-        "products"
-    }
+    type Id = Uuid;
 
-    fn primary_key() -> &'static str {
-        "product_oid"
-    }
-
-    fn from_row(
-        row: tokio_postgres::Row,
-    ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(Product {
-            product_oid: row.get::<_, Uuid>("product_oid"),
-            name: row.get::<_, String>("name"),
-            price: row.get::<_, i32>("price"),
-        })
-    }
-
-    fn to_insert_params(&self) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> {
-        vec![&self.product_oid, &self.name, &self.price]
-    }
-
-    fn to_update_params(&self) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)> {
-        vec![&self.name, &self.price]
-    }
-
-    fn primary_key_value(&self) -> &(dyn tokio_postgres::types::ToSql + Sync) {
+    fn id(&self) -> &Self::Id {
         &self.product_oid
-    }
-
-    fn fields() -> Vec<&'static str> {
-        vec!["product_oid", "name", "price"]
     }
 
     fn has_id(&self) -> bool {
@@ -58,46 +22,53 @@ impl Entity for Product {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== Flux Basic Usage Example ===\n");
+pub struct ProductReadRepository {
+    products: Vec<Product>,
+}
 
-    // Connect to database
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://postgres:postgres@localhost/pdv".to_string());
+#[async_trait::async_trait]
+impl ReadRepository<Product> for ProductReadRepository {
+    async fn find_by_id(&self, id: &Uuid) -> Result<Product> {
+        self.products
+            .iter()
+            .find(|product| product.id() == id)
+            .cloned()
+            .ok_or(RepositoryError::NotFound)
+    }
 
-    println!("Connecting to database...");
-    let (client, connection) = tokio_postgres::connect(&database_url, NoTls).await?;
+    async fn find_page(&self, page: PageRequest<Uuid>) -> Result<Page<Product, Uuid>> {
+        let limit = page.limit();
+        let items = self.products.iter().take(limit as usize).cloned().collect();
+        Ok(Page::new(
+            items,
+            limit,
+            None,
+            Some(self.products.len() as u64),
+        ))
+    }
 
-    // Spawn connection task
-    tokio::spawn(async move {
-        if let Err(e) = connection.await {
-            eprintln!("Connection error: {}", e);
-        }
-    });
+    async fn find_all_with_filter(
+        &self,
+        _filter: GenericFilter<Product>,
+        page: PageRequest<Uuid>,
+    ) -> Result<Page<Product, Uuid>> {
+        self.find_page(page).await
+    }
 
-    let client = Arc::new(client);
+    async fn exists(&self, id: &Uuid) -> Result<bool> {
+        Ok(self.products.iter().any(|product| product.id() == id))
+    }
 
-    // Create repository
-    let _repo: PostgresRepository<Product> = PostgresRepository::new(client.clone());
+    async fn count(&self) -> Result<u64> {
+        Ok(self.products.len() as u64)
+    }
+}
 
-    println!("✅ Connected! Repository created.\n");
+fn main() {
+    let _filter = GenericFilter::<Product>::new()
+        .eq("name", "Keyboard")
+        .gte("price", 100)
+        .order_by("price", OrderDirection::Desc);
 
-    // Example operations would go here:
-    println!("Example operations:");
-    println!("  1. repo.find_by_id(id).await?");
-    println!("  2. repo.find_all().await?");
-    println!("  3. repo.save(product).await?");
-    println!("  4. repo.delete(id).await?");
-    println!("  5. repo.count().await?");
-    println!("  6. repo.exists(id).await?");
-
-    println!("\n⚠️  Full example requires:");
-    println!("  1. PostgreSQL database running");
-    println!("  2. 'products' table created");
-    println!("  3. Proper schema matching Product entity");
-
-    println!("\n✅ PostgresRepository implementation is complete!");
-
-    Ok(())
+    let _page = PageRequest::<Uuid>::cursor(50, None);
 }

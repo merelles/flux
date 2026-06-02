@@ -1,126 +1,106 @@
-use std::sync::Arc;
+use std::marker::PhantomData;
 
-use tokio_postgres::types::ToSql;
+use uuid::Uuid;
 
-use crate::entity::Entity;
-
-/// Generic filter trait
-pub trait Filter: Send + Sync {
-    /// Builds a SQL query with this filter
-    ///
-    /// Returns a tuple of (SQL clause, parameters)
-    fn build_query(&self) -> (String, Vec<Arc<dyn ToSql + Sync + Send>>);
-}
-
-/// Builder for creating filters fluently
-pub struct FilterBuilder<T> {
-    conditions: Vec<(String, Arc<dyn ToSql + Sync + Send>)>,
-    order_by: Option<(String, OrderDirection)>,
-    limit: Option<u64>,
-    offset: Option<u64>,
-    _marker: std::marker::PhantomData<T>,
-}
-
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OrderDirection {
     Asc,
     Desc,
 }
 
-impl<T> FilterBuilder<T> {
-    pub fn new() -> Self {
-        Self {
-            conditions: Vec::new(),
-            order_by: None,
-            limit: None,
-            offset: None,
-            _marker: std::marker::PhantomData,
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderClause {
+    pub field: String,
+    pub direction: OrderDirection,
+}
 
-    /// Adds an equality condition
-    pub fn eq(mut self, field: &str, value: impl ToSql + Send + Sync + 'static) -> Self {
-        self.conditions.push((field.to_string(), Arc::new(value)));
-        self
-    }
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterValue {
+    Bool(bool),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    F64(f64),
+    String(String),
+    Uuid(Uuid),
+    Null,
+}
 
-    /// Adds a condition (for compatibility with old API)
-    pub fn with_condition(self, field: &str, value: impl ToSql + Send + Sync + 'static) -> Self {
-        self.eq(field, value)
-    }
+macro_rules! impl_filter_value {
+    ($($ty:ty => $variant:ident),* $(,)?) => {
+        $(
+            impl From<$ty> for FilterValue {
+                fn from(value: $ty) -> Self {
+                    Self::$variant(value)
+                }
+            }
+        )*
+    };
+}
 
-    /// Adds an ordering clause
-    pub fn order_by(mut self, field: &str, direction: OrderDirection) -> Self {
-        self.order_by = Some((field.to_string(), direction));
-        self
-    }
+impl_filter_value!(
+    bool => Bool,
+    i16 => I16,
+    i32 => I32,
+    i64 => I64,
+    u16 => U16,
+    u32 => U32,
+    u64 => U64,
+    f64 => F64,
+    String => String,
+    Uuid => Uuid,
+);
 
-    /// Sets the limit for results
-    pub fn limit(mut self, n: u64) -> Self {
-        self.limit = Some(n);
-        self
-    }
-
-    /// Sets the offset for results
-    pub fn offset(mut self, n: u64) -> Self {
-        self.offset = Some(n);
-        self
+impl From<&str> for FilterValue {
+    fn from(value: &str) -> Self {
+        Self::String(value.to_string())
     }
 }
 
-impl<T> Default for FilterBuilder<T> {
-    fn default() -> Self {
-        Self::new()
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterOp {
+    Eq,
+    Ne,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    In,
+    Like,
+    IsNull,
+    IsNotNull,
 }
 
-/// Generic filter implementation for entities
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterOperand {
+    None,
+    Single(FilterValue),
+    Many(Vec<FilterValue>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FilterCondition {
+    pub field: String,
+    pub op: FilterOp,
+    pub operand: FilterOperand,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FilterExpr {
+    Condition(FilterCondition),
+    And(Vec<FilterExpr>),
+    Or(Vec<FilterExpr>),
+    Not(Box<FilterExpr>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct GenericFilter<T> {
-    conditions: Vec<(String, Arc<dyn ToSql + Sync + Send>)>,
-    order_by: Option<(String, OrderDirection)>,
-    limit: Option<u64>,
-    offset: Option<u64>,
-    _marker: std::marker::PhantomData<T>,
-}
-
-impl<T> GenericFilter<T> {
-    /// Creates a new filter with no conditions
-    pub fn new() -> Self {
-        Self {
-            conditions: Vec::new(),
-            order_by: None,
-            limit: None,
-            offset: None,
-            _marker: std::marker::PhantomData,
-        }
-    }
-
-    /// Adds a condition for filtering
-    pub fn with_condition(
-        mut self,
-        field: &str,
-        value: impl ToSql + Send + Sync + 'static,
-    ) -> Self {
-        self.conditions.push((field.to_string(), Arc::new(value)));
-        self
-    }
-
-    /// Adds ordering
-    pub fn with_order_by(mut self, field: &str, direction: OrderDirection) -> Self {
-        self.order_by = Some((field.to_string(), direction));
-        self
-    }
-
-    /// Sets the limit
-    pub fn with_limit(mut self, n: u64) -> Self {
-        self.limit = Some(n);
-        self
-    }
-
-    /// Sets the offset
-    pub fn with_offset(mut self, n: u64) -> Self {
-        self.offset = Some(n);
-        self
-    }
+    expressions: Vec<FilterExpr>,
+    order_by: Vec<OrderClause>,
+    _marker: PhantomData<T>,
 }
 
 impl<T> Default for GenericFilter<T> {
@@ -129,57 +109,174 @@ impl<T> Default for GenericFilter<T> {
     }
 }
 
-impl<T: Entity> Filter for GenericFilter<T> {
-    fn build_query(&self) -> (String, Vec<Arc<dyn ToSql + Sync + Send>>) {
-        let mut where_clause = String::new();
-        let mut params = Vec::new();
-
-        if !self.conditions.is_empty() {
-            where_clause = "WHERE ".to_string();
-            let conditions: Vec<String> = self
-                .conditions
-                .iter()
-                .enumerate()
-                .map(|(i, (field, _))| format!("{} = ${}", field, i + 1))
-                .collect();
-            where_clause.push_str(&conditions.join(" AND "));
-
-            params.extend(self.conditions.iter().map(|(_, val)| Arc::clone(val)));
+impl<T> GenericFilter<T> {
+    pub fn new() -> Self {
+        Self {
+            expressions: Vec::new(),
+            order_by: Vec::new(),
+            _marker: PhantomData,
         }
+    }
 
-        // Add ORDER BY
-        if let Some((field, direction)) = &self.order_by {
-            let dir_str = match direction {
-                OrderDirection::Asc => "ASC",
-                OrderDirection::Desc => "DESC",
-            };
-            where_clause.push_str(&format!(" ORDER BY {} {}", field, dir_str));
+    pub fn expressions(&self) -> &[FilterExpr] {
+        &self.expressions
+    }
+
+    pub fn order_by_clauses(&self) -> &[OrderClause] {
+        &self.order_by
+    }
+
+    pub fn into_expr(self) -> Option<FilterExpr> {
+        match self.expressions.len() {
+            0 => None,
+            1 => self.expressions.into_iter().next(),
+            _ => Some(FilterExpr::And(self.expressions)),
         }
+    }
 
-        // Add LIMIT
-        if let Some(limit) = self.limit {
-            params.push(Arc::new(limit as i64));
-            where_clause.push_str(&format!(" LIMIT ${}", params.len()));
+    pub fn with_condition(self, field: &str, value: impl Into<FilterValue>) -> Self {
+        self.eq(field, value)
+    }
+
+    pub fn eq(self, field: &str, value: impl Into<FilterValue>) -> Self {
+        self.condition(field, FilterOp::Eq, FilterOperand::Single(value.into()))
+    }
+
+    pub fn ne(self, field: &str, value: impl Into<FilterValue>) -> Self {
+        self.condition(field, FilterOp::Ne, FilterOperand::Single(value.into()))
+    }
+
+    pub fn gt(self, field: &str, value: impl Into<FilterValue>) -> Self {
+        self.condition(field, FilterOp::Gt, FilterOperand::Single(value.into()))
+    }
+
+    pub fn gte(self, field: &str, value: impl Into<FilterValue>) -> Self {
+        self.condition(field, FilterOp::Gte, FilterOperand::Single(value.into()))
+    }
+
+    pub fn lt(self, field: &str, value: impl Into<FilterValue>) -> Self {
+        self.condition(field, FilterOp::Lt, FilterOperand::Single(value.into()))
+    }
+
+    pub fn lte(self, field: &str, value: impl Into<FilterValue>) -> Self {
+        self.condition(field, FilterOp::Lte, FilterOperand::Single(value.into()))
+    }
+
+    pub fn like(self, field: &str, value: impl Into<FilterValue>) -> Self {
+        self.condition(field, FilterOp::Like, FilterOperand::Single(value.into()))
+    }
+
+    pub fn is_null(self, field: &str) -> Self {
+        self.condition(field, FilterOp::IsNull, FilterOperand::None)
+    }
+
+    pub fn is_not_null(self, field: &str) -> Self {
+        self.condition(field, FilterOp::IsNotNull, FilterOperand::None)
+    }
+
+    pub fn in_list<I, V>(self, field: &str, values: I) -> Self
+    where
+        I: IntoIterator<Item = V>,
+        V: Into<FilterValue>,
+    {
+        let values = values.into_iter().map(Into::into).collect();
+        self.condition(field, FilterOp::In, FilterOperand::Many(values))
+    }
+
+    pub fn with_order_by(self, field: &str, direction: OrderDirection) -> Self {
+        self.order_by(field, direction)
+    }
+
+    pub fn order_by(mut self, field: &str, direction: OrderDirection) -> Self {
+        self.order_by.push(OrderClause {
+            field: field.to_string(),
+            direction,
+        });
+        self
+    }
+
+    pub fn and<F>(mut self, build: F) -> Self
+    where
+        F: FnOnce(Self) -> Self,
+    {
+        if let Some(expr) = build(Self::new()).into_expr() {
+            self.expressions.push(expr);
         }
+        self
+    }
 
-        // Add OFFSET
-        if let Some(offset) = self.offset {
-            params.push(Arc::new(offset as i64));
-            where_clause.push_str(&format!(" OFFSET ${}", params.len()));
+    pub fn and_group<F>(self, build: F) -> Self
+    where
+        F: FnOnce(Self) -> Self,
+    {
+        self.and(build)
+    }
+
+    pub fn or<F>(mut self, build: F) -> Self
+    where
+        F: FnOnce(Self) -> Self,
+    {
+        if let Some(expr) = build(Self::new()).into_expr() {
+            match self.expressions.last_mut() {
+                Some(FilterExpr::Or(items)) => items.push(expr),
+                _ => self.expressions.push(FilterExpr::Or(vec![expr])),
+            }
         }
+        self
+    }
 
-        (where_clause, params)
+    pub fn not<F>(mut self, build: F) -> Self
+    where
+        F: FnOnce(Self) -> Self,
+    {
+        if let Some(expr) = build(Self::new()).into_expr() {
+            self.expressions.push(FilterExpr::Not(Box::new(expr)));
+        }
+        self
+    }
+
+    fn condition(mut self, field: &str, op: FilterOp, operand: FilterOperand) -> Self {
+        self.expressions
+            .push(FilterExpr::Condition(FilterCondition {
+                field: field.to_string(),
+                op,
+                operand,
+            }));
+        self
     }
 }
 
-impl<T> From<FilterBuilder<T>> for GenericFilter<T> {
-    fn from(builder: FilterBuilder<T>) -> Self {
-        Self {
-            conditions: builder.conditions,
-            order_by: builder.order_by,
-            limit: builder.limit,
-            offset: builder.offset,
-            _marker: std::marker::PhantomData,
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Product;
+
+    #[test]
+    fn builds_and_expression_from_multiple_conditions() {
+        let expr = GenericFilter::<Product>::new()
+            .eq("name", "Keyboard")
+            .gte("price", 100)
+            .into_expr()
+            .expect("filter expression");
+
+        match expr {
+            FilterExpr::And(items) => assert_eq!(items.len(), 2),
+            other => panic!("expected AND expression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn builds_or_expression_from_group() {
+        let expr = GenericFilter::<Product>::new()
+            .or(|query| query.eq("status", "open"))
+            .or(|query| query.eq("status", "paid"))
+            .into_expr()
+            .expect("filter expression");
+
+        match expr {
+            FilterExpr::Or(items) => assert_eq!(items.len(), 2),
+            other => panic!("expected OR expression, got {other:?}"),
         }
     }
 }

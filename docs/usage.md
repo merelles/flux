@@ -2,6 +2,16 @@
 
 Status: this document separates the API that exists today from the API we should build next.
 
+The intended workspace should be split into focused crates:
+
+- `flux`: core traits, errors, filters, pagination, repository contracts, aggregate metadata
+- `flux-derive`: derive macros for entities, SQL mappings, Mongo mappings, and aggregates
+- `flux-postgres`: PostgreSQL adapter and SQL rendering
+- `flux-mongodb`: MongoDB adapter and BSON rendering
+- `flux-sqlserver`: future SQL Server adapter
+
+The `flux` crate must not depend on database drivers. Backend-specific crates depend on `flux`, not the other way around.
+
 The current CRUD API is useful for one table at a time. The missing part is aggregate persistence:
 
 ```rust
@@ -22,7 +32,7 @@ Available today:
 - `#[table_name = "..."]`
 - `#[primary_key]`
 - `#[skip]`
-- `PostgresRepository<T>`
+- `PostgresRepository<T>` inside the current `flux` crate
 - `find_by_id`
 - `find_all`
 - `find_all_with_filter`
@@ -51,6 +61,7 @@ Not complete today:
 - `#[many_to_many]`
 - `AggregateRoot` derive macro
 - backend-neutral filters for SQL and Mongo
+- separate adapter crates such as `flux-postgres` and `flux-mongodb`
 
 ## Design Direction
 
@@ -72,6 +83,80 @@ The lesson for Flux:
 - do not make `insert` secretly traverse arbitrary object graphs
 - do not expose unbounded reads as the default path
 - do not bind the core repository abstraction to `Uuid`
+- keep database drivers outside the core `flux` crate
+
+## Proposed Crate Layout
+
+```text
+crates/
+  flux/
+    src/
+      entity.rs
+      error.rs
+      filter.rs
+      page.rs
+      repository.rs
+      aggregate.rs
+  flux-derive/
+    src/
+      lib.rs
+  flux-postgres/
+    src/
+      lib.rs
+      repository.rs
+      filter.rs
+      entity.rs
+  flux-mongodb/
+    src/
+      lib.rs
+      repository.rs
+      filter.rs
+      entity.rs
+  flux-sqlserver/
+    src/
+      lib.rs
+```
+
+Dependency direction:
+
+```text
+app
+  -> flux
+  -> flux-derive
+  -> flux-postgres
+  -> flux-mongodb
+
+flux-postgres -> flux
+flux-mongodb  -> flux
+flux-derive   -> flux
+flux          -> no database driver
+```
+
+This keeps the core small and avoids forcing Mongo projects to compile Postgres dependencies or SQL projects to compile Mongo dependencies.
+
+## Proposed Dependencies
+
+Postgres application:
+
+```toml
+[dependencies]
+flux = { path = "crates/flux" }
+flux-derive = { path = "crates/flux-derive" }
+flux-postgres = { path = "crates/flux-postgres" }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+```
+
+Mongo application:
+
+```toml
+[dependencies]
+flux = { path = "crates/flux" }
+flux-derive = { path = "crates/flux-derive" }
+flux-mongodb = { path = "crates/flux-mongodb" }
+tokio = { version = "1", features = ["full"] }
+mongodb = "3"
+```
 
 ## Proposed Interface Segregation
 
@@ -81,8 +166,6 @@ Flux should split repository behavior into small traits.
 pub trait Entity: Send + Sync + Sized + Clone {
     type Id: EntityId;
 
-    fn table_name() -> &'static str;
-    fn primary_key() -> &'static str;
     fn id(&self) -> &Self::Id;
 }
 
@@ -95,9 +178,6 @@ impl EntityId for i64 {}
 impl EntityId for u32 {}
 impl EntityId for u64 {}
 impl EntityId for String {}
-
-#[cfg(feature = "mongo")]
-impl EntityId for mongodb::bson::oid::ObjectId {}
 
 pub enum PageRequest<Id> {
     Offset {
@@ -165,6 +245,15 @@ pub trait AggregateRepository<A: AggregateRoot>: Send + Sync {
     async fn save_graph(&self, aggregate: &A, mode: GraphSaveMode) -> Result<A>;
     async fn delete_graph(&self, id: &A::Id) -> Result<bool>;
 }
+```
+
+Backend crates add their own ID support through local newtypes or conversion traits. A crate outside `flux` cannot implement `flux::EntityId` directly for `mongodb::bson::oid::ObjectId` because both the trait and the type are external to that adapter crate.
+
+```rust
+// flux-mongodb
+pub struct MongoObjectId(pub mongodb::bson::oid::ObjectId);
+
+impl flux::EntityId for MongoObjectId {}
 ```
 
 The existing `Repository<T>` can remain as a convenience trait that combines the common traits.
@@ -235,9 +324,6 @@ pub enum FilterValue {
     Uuid(uuid::Uuid),
     String(String),
     Null,
-
-    #[cfg(feature = "mongo")]
-    ObjectId(mongodb::bson::oid::ObjectId),
 }
 
 pub enum FilterOp {
@@ -255,15 +341,31 @@ pub enum FilterOp {
 
 The Postgres adapter turns this into SQL and bind parameters. The Mongo adapter turns it into a BSON document.
 
+Mongo-specific values should be adapted in `flux-mongodb`, not added as hard dependencies in `flux`. If `ObjectId` needs first-class filter support, the extension point should live in `flux-mongodb`.
+
 ## Proposed Entity Syntax
 
-`Entity` maps only the table columns.
+`Entity` belongs to `flux` and represents the domain identity. It should not know if the data comes from Postgres, Mongo, SQL Server, or another backend.
 
 ```rust
-use flux::Uuid;
-use flux_derive::Entity;
+use flux::Entity;
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Entity)]
+pub struct Product {
+    #[primary_key]
+    pub product_oid: Uuid,
+    pub name: String,
+}
+```
+
+SQL mapping belongs to `flux-postgres`. The trait is defined by `flux-postgres`; the implementation can be generated by `flux-derive`.
+
+```rust
+use flux_derive::{Entity, SqlEntity};
+use uuid::Uuid;
+
+#[derive(Clone, Debug, Entity, SqlEntity)]
 #[table_name = "order_items"]
 pub struct OrderItem {
     #[primary_key]
@@ -274,15 +376,30 @@ pub struct OrderItem {
 }
 ```
 
-## Proposed Aggregate Syntax
-
-`AggregateRoot` maps relations. Relation fields are ignored by `Entity` automatically.
+Mongo mapping belongs to `flux-mongodb`. The trait is defined by `flux-mongodb`; the implementation can be generated by `flux-derive`.
 
 ```rust
-use flux::Uuid;
-use flux_derive::{AggregateRoot, Entity};
+use flux_derive::{Entity, MongoEntity};
+use flux_mongodb::MongoObjectId;
 
-#[derive(Clone, Debug, Entity, AggregateRoot)]
+#[derive(Clone, Debug, Entity, MongoEntity)]
+#[collection_name = "customers"]
+pub struct Customer {
+    #[primary_key]
+    pub id: MongoObjectId,
+    pub name: String,
+}
+```
+
+## Proposed Aggregate Syntax
+
+`AggregateRoot` belongs to `flux` and maps relations. Relation fields are ignored by backend row/document mapping.
+
+```rust
+use flux_derive::{AggregateRoot, Entity, SqlEntity};
+use uuid::Uuid;
+
+#[derive(Clone, Debug, Entity, SqlEntity, AggregateRoot)]
 #[table_name = "orders"]
 pub struct Order {
     #[primary_key]
@@ -303,6 +420,26 @@ This should generate metadata equivalent to:
 - `items` is not part of `INSERT INTO orders (...)`
 - `items` is not part of `UPDATE orders SET ...`
 - replacing an order can delete missing child rows
+
+`flux-postgres` implements the SQL graph persistence. A future `flux-mongodb` implementation may store relations as references or embedded documents depending on Mongo mapping metadata.
+
+## Repository Setup
+
+Postgres:
+
+```rust
+use flux_postgres::PostgresRepository;
+
+let order_repo = PostgresRepository::<Order>::new(pool.clone());
+```
+
+Mongo:
+
+```rust
+use flux_mongodb::MongoRepository;
+
+let customer_repo = MongoRepository::<Customer>::new(database.clone());
+```
 
 ## Select Syntax
 
@@ -553,7 +690,7 @@ pub items: Vec<OrderItem>,
 ## One To One
 
 ```rust
-#[derive(Clone, Debug, Entity, AggregateRoot)]
+#[derive(Clone, Debug, Entity, SqlEntity, AggregateRoot)]
 #[table_name = "users"]
 pub struct User {
     #[primary_key]
@@ -564,7 +701,7 @@ pub struct User {
     pub profile: Option<UserProfile>,
 }
 
-#[derive(Clone, Debug, Entity)]
+#[derive(Clone, Debug, Entity, SqlEntity)]
 #[table_name = "user_profiles"]
 pub struct UserProfile {
     #[primary_key]
@@ -587,7 +724,7 @@ let saved_user = user_repo.save_graph(&user, GraphSaveMode::UpsertChildren).awai
 ## One To Many
 
 ```rust
-#[derive(Clone, Debug, Entity, AggregateRoot)]
+#[derive(Clone, Debug, Entity, SqlEntity, AggregateRoot)]
 #[table_name = "orders"]
 pub struct Order {
     #[primary_key]
@@ -618,7 +755,7 @@ No application-level loop is needed. The aggregate repository should call `inser
 For a plain join table without extra fields:
 
 ```rust
-#[derive(Clone, Debug, Entity, AggregateRoot)]
+#[derive(Clone, Debug, Entity, SqlEntity, AggregateRoot)]
 #[table_name = "students"]
 pub struct Student {
     #[primary_key]
@@ -635,7 +772,7 @@ pub struct Student {
     pub courses: Vec<Course>,
 }
 
-#[derive(Clone, Debug, Entity)]
+#[derive(Clone, Debug, Entity, SqlEntity)]
 #[table_name = "courses"]
 pub struct Course {
     #[primary_key]
@@ -659,7 +796,7 @@ let saved_student = student_repo
 For a join table with extra fields, model the join row as its own entity.
 
 ```rust
-#[derive(Clone, Debug, Entity, AggregateRoot)]
+#[derive(Clone, Debug, Entity, SqlEntity, AggregateRoot)]
 #[table_name = "students"]
 pub struct Student {
     #[primary_key]
@@ -670,7 +807,7 @@ pub struct Student {
     pub enrollments: Vec<Enrollment>,
 }
 
-#[derive(Clone, Debug, Entity)]
+#[derive(Clone, Debug, Entity, SqlEntity)]
 #[table_name = "enrollments"]
 pub struct Enrollment {
     #[primary_key]
@@ -712,16 +849,14 @@ The core entity contract should use an associated type:
 pub trait Entity: Send + Sync + Sized + Clone {
     type Id: EntityId;
 
-    fn table_name() -> &'static str;
-    fn primary_key() -> &'static str;
     fn id(&self) -> &Self::Id;
 }
 ```
 
-That allows UUID, integers, strings, and Mongo ObjectId:
+That allows UUID, integers, strings, and Mongo IDs through adapter-owned newtypes:
 
 ```rust
-#[derive(Clone, Debug, Entity)]
+#[derive(Clone, Debug, Entity, SqlEntity)]
 #[table_name = "products"]
 pub struct Product {
     #[primary_key]
@@ -729,7 +864,7 @@ pub struct Product {
     pub name: String,
 }
 
-#[derive(Clone, Debug, Entity)]
+#[derive(Clone, Debug, Entity, SqlEntity)]
 #[table_name = "categories"]
 pub struct Category {
     #[primary_key]
@@ -737,12 +872,11 @@ pub struct Category {
     pub name: String,
 }
 
-#[cfg(feature = "mongo")]
-#[derive(Clone, Debug, Entity)]
+#[derive(Clone, Debug, Entity, MongoEntity)]
 #[collection_name = "customers"]
 pub struct Customer {
     #[primary_key]
-    pub id: mongodb::bson::oid::ObjectId,
+    pub id: flux_mongodb::MongoObjectId,
     pub name: String,
 }
 ```
@@ -755,12 +889,17 @@ That means Flux should split backend-specific mapping:
 
 ```rust
 pub trait SqlEntity: Entity {
+    fn table_name() -> &'static str;
+    fn primary_key() -> &'static str;
     fn from_row(row: tokio_postgres::Row) -> Result<Self>;
     fn to_insert_params(&self) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)>;
     fn to_update_params(&self) -> Vec<&(dyn tokio_postgres::types::ToSql + Sync)>;
 }
+```
 
-#[cfg(feature = "mongo")]
+`flux-mongodb` owns Mongo document mapping:
+
+```rust
 pub trait MongoEntity: Entity {
     fn collection_name() -> &'static str;
     fn from_document(document: mongodb::bson::Document) -> Result<Self>;
@@ -791,20 +930,23 @@ Database-generated IDs can be supported later, but they require the aggregate re
 
 ## Recommended Implementation Order
 
-1. Replace fixed `Uuid` repository signatures with `T::Id`
-2. Fix `EntityExt::get_id()` generation in `flux-derive`
-3. Replace unbounded `find_all` with paged reads
-4. Move `GenericFilter` toward a backend-neutral filter AST
-5. Add `BulkRepository<T>`
-6. Implement Postgres `insert_many`
-7. Implement Postgres `save_many` with `ON CONFLICT`
-8. Add relation attributes to `flux-derive`
-9. Generate `AggregateRoot` metadata
-10. Add `AggregateRepository<A>`
-11. Implement `insert_graph`
-12. Implement `save_graph`
-13. Add many-to-many support
-14. Add Mongo repository traits and adapter implementation
+1. Split the workspace into `flux`, `flux-derive`, `flux-postgres`, and future adapter crates
+2. Move Postgres-specific traits and repository code into `flux-postgres`
+3. Keep `flux` limited to core traits, errors, filters, pagination, and repository contracts
+4. Replace fixed `Uuid` repository signatures with `T::Id`
+5. Fix entity ID generation in `flux-derive`
+6. Replace unbounded `find_all` with paged reads
+7. Move `GenericFilter` toward a backend-neutral filter AST
+8. Add `BulkRepository<T>`
+9. Implement Postgres `insert_many`
+10. Implement Postgres `save_many` with `ON CONFLICT`
+11. Add relation attributes to `flux-derive`
+12. Generate `AggregateRoot` metadata
+13. Add `AggregateRepository<A>`
+14. Implement `insert_graph`
+15. Implement `save_graph`
+16. Add many-to-many support
+17. Add `flux-mongodb` repository traits and adapter implementation
 
 ## API Position
 

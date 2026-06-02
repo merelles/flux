@@ -1,6 +1,6 @@
 use proc_macro::TokenStream;
 use quote::quote;
-use syn::{parse_macro_input, Attribute, Data, DataEnum, DeriveInput, Fields, Ident, Lit, Meta};
+use syn::{parse_macro_input, Data, DataEnum, DeriveInput, Fields, Ident, Type};
 
 #[proc_macro_derive(Enum)]
 pub fn enum_sql_derive(input: TokenStream) -> TokenStream {
@@ -90,40 +90,18 @@ pub fn entity_derive(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
     let name = &input.ident;
 
-    let table_name = extract_table_name(&input.attrs);
-    let primary_key_ident = extract_primary_key(&input);
-    let primary_key_str = primary_key_ident.to_string();
-
-    let (field_names, field_idents, _field_types, skipped_field_idents, update_field_idents) =
-        extract_fields(&input, &primary_key_ident);
+    let (primary_key_ident, primary_key_ty) = extract_primary_key(&input);
 
     let expanded = quote! {
         impl ::flux::Entity for #name {
-            fn table_name() -> &'static str { #table_name }
-            fn primary_key() -> &'static str { #primary_key_str }
-            fn fields() -> Vec<&'static str> { vec![#(#field_names),*] }
+            type Id = #primary_key_ty;
 
-            fn from_row(row: ::tokio_postgres::Row) -> ::std::result::Result<Self, ::std::boxed::Box<dyn ::std::error::Error + ::std::marker::Send + ::std::marker::Sync>> {
-                Ok(Self {
-                    #( #field_idents: row.try_get(#field_names)?, )*
-                    #( #skipped_field_idents: ::std::default::Default::default(), )*
-                })
-            }
-
-            fn to_insert_params(&self) -> Vec<&(dyn ::tokio_postgres::types::ToSql + ::std::marker::Sync)> {
-                vec![#( &self.#field_idents ),*]
-            }
-
-            fn to_update_params(&self) -> Vec<&(dyn ::tokio_postgres::types::ToSql + ::std::marker::Sync)> {
-                vec![#( &self.#update_field_idents ),*]
-            }
-
-            fn primary_key_value(&self) -> &(dyn ::tokio_postgres::types::ToSql + ::std::marker::Sync) {
+            fn id(&self) -> &Self::Id {
                 &self.#primary_key_ident
             }
 
             fn has_id(&self) -> bool {
-                true // TODO: Implement based on PK type
+                true
             }
         }
     };
@@ -131,90 +109,19 @@ pub fn entity_derive(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-fn extract_table_name(attrs: &[Attribute]) -> String {
-    for attr in attrs {
-        if attr.path().is_ident("table_name") {
-            if let Meta::NameValue(meta) = &attr.meta {
-                if let syn::Expr::Lit(expr_lit) = &meta.value {
-                    if let Lit::Str(lit) = &expr_lit.lit {
-                        return lit.value();
-                    }
-                }
-            }
-        }
-    }
-    panic!("Missing #[table_name = \"...\"] attribute");
-}
-
-fn extract_primary_key(input: &DeriveInput) -> Ident {
+fn extract_primary_key(input: &DeriveInput) -> (Ident, Type) {
     if let Data::Struct(data) = &input.data {
         if let Fields::Named(fields) = &data.fields {
             for field in &fields.named {
                 for attr in &field.attrs {
                     if attr.path().is_ident("primary_key") {
-                        return field.ident.clone().unwrap();
+                        return (field.ident.clone().unwrap(), field.ty.clone());
                     }
                 }
             }
         }
     }
     panic!("No field marked with #[primary_key]");
-}
-
-fn extract_fields(
-    input: &DeriveInput,
-    primary_key_ident: &Ident,
-) -> (
-    Vec<String>,
-    Vec<syn::Ident>,
-    Vec<String>,
-    Vec<syn::Ident>,
-    Vec<syn::Ident>,
-) {
-    let mut field_names = Vec::new();
-    let mut field_idents = Vec::new();
-    let mut field_types = Vec::new();
-    let mut skipped_field_idents = Vec::new();
-    let mut update_field_idents = Vec::new();
-
-    if let Data::Struct(data) = &input.data {
-        if let Fields::Named(fields) = &data.fields {
-            for field in &fields.named {
-                let mut skip = false;
-
-                for attr in &field.attrs {
-                    if attr.path().is_ident("skip") {
-                        skip = true;
-                        break;
-                    }
-                }
-
-                if let Some(ident) = &field.ident {
-                    if skip {
-                        skipped_field_idents.push(ident.clone());
-                        continue;
-                    }
-
-                    field_names.push(ident.to_string());
-                    field_idents.push(ident.clone());
-                    let type_str = quote::quote! { #field.ty }.to_string();
-                    field_types.push(type_str);
-
-                    // Add to update fields if not primary key
-                    if ident != primary_key_ident {
-                        update_field_idents.push(ident.clone());
-                    }
-                }
-            }
-        }
-    }
-    (
-        field_names,
-        field_idents,
-        field_types,
-        skipped_field_idents,
-        update_field_idents,
-    )
 }
 
 // TODO: Implement AggregateRoot derive macro

@@ -1,85 +1,92 @@
-use std::result::Result;
-
 use async_trait::async_trait;
-use uuid::Uuid;
 
-use crate::entity::Entity;
-use crate::error::RepositoryError;
+use crate::{AggregateRoot, Entity, EntityId, GenericFilter, Include, Page, PageRequest, Result};
 
-/// Generic repository interface for CRUD operations
-///
-/// This trait provides a clean abstraction over data persistence.
-/// Implementations should be database-agnostic, but we primarily use PostgreSQL.
 #[async_trait]
-pub trait Repository<T: Entity>: Send + Sync {
-    /// Finds a single entity by its primary key
-    ///
-    /// # Errors
-    /// Returns `RepositoryError::NotFound` if no entity exists with the given ID
-    async fn find_by_id(&self, id: Uuid) -> Result<T, RepositoryError>;
+pub trait ReadRepository<T: Entity>: Send + Sync {
+    async fn find_by_id(&self, id: &T::Id) -> Result<T>;
 
-    /// Finds multiple entities using a specification
-    ///
-    /// Returns an empty vector if no entities match the specification.
-    async fn find_all(&self) -> Result<Vec<T>, RepositoryError>;
+    async fn find_page(&self, page: PageRequest<T::Id>) -> Result<Page<T, T::Id>>;
 
-    /// Finds multiple entities using a filter
-    ///
-    /// Returns an empty vector if no entities match the filter.
     async fn find_all_with_filter(
         &self,
-        filter: crate::filter::GenericFilter<T>,
-    ) -> Result<Vec<T>, RepositoryError>;
+        filter: GenericFilter<T>,
+        page: PageRequest<T::Id>,
+    ) -> Result<Page<T, T::Id>>;
 
-    /// Saves an entity (insert or update)
-    ///
-    /// If the entity has an ID and exists in the database, it will be updated.
-    /// Otherwise, a new entity will be inserted.
-    ///
-    /// # Returns
-    /// Returns the saved entity with any generated fields filled in
-    async fn save(&self, entity: T) -> Result<T, RepositoryError>;
+    async fn exists(&self, id: &T::Id) -> Result<bool>;
 
-    /// Inserts a new entity
-    ///
-    /// # Errors
-    /// Returns an error if an entity with the same ID already exists
-    async fn insert(&self, entity: T) -> Result<T, RepositoryError>;
+    async fn count(&self) -> Result<u64>;
+}
 
-    /// Updates an existing entity
-    ///
-    /// # Errors
-    /// Returns `RepositoryError::NotFound` if the entity doesn't exist
-    async fn update(&self, entity: T) -> Result<T, RepositoryError>;
+#[async_trait]
+pub trait WriteRepository<T: Entity>: Send + Sync {
+    async fn insert(&self, entity: &T) -> Result<T>;
 
-    /// Deletes an entity by its primary key
-    ///
-    /// # Returns
-    /// Returns `true` if an entity was deleted, `false` if no entity existed
-    async fn delete(&self, id: Uuid) -> Result<bool, RepositoryError>;
+    async fn update(&self, entity: &T) -> Result<T>;
 
-    /// Checks if an entity exists with the given primary key
-    async fn exists(&self, id: Uuid) -> Result<bool, RepositoryError>;
+    async fn save(&self, entity: &T) -> Result<T>;
 
-    /// Counts entities matching a specification
-    async fn count(&self) -> Result<u64, RepositoryError>;
+    async fn delete(&self, id: &T::Id) -> Result<bool>;
+}
 
-    /// Finds entities by a foreign key field
-    ///
-    /// Returns an empty vector if no entities match.
-    async fn find_by_foreign_key(
+#[async_trait]
+pub trait BulkRepository<T: Entity>: Send + Sync {
+    async fn insert_many(&self, entities: &[T]) -> Result<Vec<T>>;
+
+    async fn update_many(&self, entities: &[T]) -> Result<Vec<T>>;
+
+    async fn save_many(&self, entities: &[T]) -> Result<Vec<T>>;
+
+    async fn delete_many(&self, ids: &[T::Id]) -> Result<u64>;
+}
+
+#[async_trait]
+pub trait RelationRepository<T: Entity>: Send + Sync {
+    async fn find_by_foreign_key<K>(
         &self,
         field: &str,
-        value: &Uuid,
-    ) -> Result<Vec<T>, RepositoryError>;
+        value: &K,
+        page: PageRequest<T::Id>,
+    ) -> Result<Page<T, T::Id>>
+    where
+        K: EntityId;
 
-    /// Deletes entities by a foreign key field
-    ///
-    /// # Returns
-    /// Returns the number of entities deleted
-    async fn delete_by_foreign_key(
-        &self,
-        field: &str,
-        value: &Uuid,
-    ) -> Result<u64, RepositoryError>;
+    async fn delete_by_foreign_key<K>(&self, field: &str, value: &K) -> Result<u64>
+    where
+        K: EntityId;
+}
+
+pub trait Repository<T>:
+    ReadRepository<T> + WriteRepository<T> + BulkRepository<T> + RelationRepository<T>
+where
+    T: Entity,
+{
+}
+
+impl<T, R> Repository<T> for R
+where
+    T: Entity,
+    R: ReadRepository<T> + WriteRepository<T> + BulkRepository<T> + RelationRepository<T>,
+{
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphSaveMode {
+    AppendChildren,
+    UpsertChildren,
+    ReplaceChildren,
+}
+
+#[async_trait]
+pub trait AggregateRepository<A: AggregateRoot>: Send + Sync {
+    async fn find_graph_by_id(&self, id: &A::Id, includes: &[Include<A>]) -> Result<A>;
+
+    async fn insert_graph(&self, aggregate: &A) -> Result<A>;
+
+    async fn update_graph(&self, aggregate: &A, mode: GraphSaveMode) -> Result<A>;
+
+    async fn save_graph(&self, aggregate: &A, mode: GraphSaveMode) -> Result<A>;
+
+    async fn delete_graph(&self, id: &A::Id) -> Result<bool>;
 }
