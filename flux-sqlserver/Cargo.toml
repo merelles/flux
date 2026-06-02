@@ -1,16 +1,17 @@
 [package]
-name = "flux-postgres"
+name = "flux-sqlserver"
 version = "0.1.0"
 edition = "2021"
 authors.workspace = true
 homepage.workspace = true
 license.workspace = true
-description = "PostgreSQL adapter for flux"
+description = "SQL Server adapter for flux"
 repository.workspace = true
 
 [dependencies]
 async-trait = "0.1.87"
 flux = { path = "../flux" }
+futures-util = "0.3"
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "rust_decimal"] }
 tokio = { version = "1", features = ["sync"] }
-tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 uuid = { version = "1", features = ["v4", "serde"] }

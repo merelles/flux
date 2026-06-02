@@ -26,6 +26,10 @@ pub enum FilterValue {
     F64(f64),
     String(String),
     Uuid(Uuid),
+    Backend {
+        type_name: &'static str,
+        value: String,
+    },
     Null,
 }
 

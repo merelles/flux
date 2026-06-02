@@ -1,7 +1,8 @@
 use flux::{AggregateRoot as _, Entity as _, RelationKind};
-use flux_derive::{AggregateRoot, Entity, MongoEntity, SqlEntity};
+use flux_derive::{AggregateRoot, Entity, MongoEntity, SqlEntity, SqlServerEntity};
 use flux_mongodb::{MongoEntity as _, MongoObjectId};
 use flux_postgres::SqlEntity as _;
+use flux_sqlserver::SqlServerEntity as _;
 use mongodb::bson::oid::ObjectId;
 use uuid::Uuid;
 
@@ -13,6 +14,14 @@ struct OrderItem {
     order_oid: Uuid,
     product_name: String,
     quantity: i32,
+}
+
+#[derive(Clone, Debug, Entity, SqlServerEntity)]
+#[table_name = "categories"]
+struct Category {
+    #[primary_key]
+    category_id: i64,
+    name: String,
 }
 
 #[derive(Clone, Debug, Entity, SqlEntity, AggregateRoot)]
@@ -39,6 +48,30 @@ struct Customer {
     name: String,
     age: i32,
     active: Option<bool>,
+}
+
+#[derive(Clone, Debug, Entity, MongoEntity)]
+#[collection_name = "mongo_order_items"]
+struct MongoOrderItem {
+    #[primary_key]
+    id: MongoObjectId,
+    order_id: MongoObjectId,
+    product_name: String,
+}
+
+#[derive(Clone, Debug, Entity, MongoEntity, AggregateRoot)]
+#[collection_name = "mongo_orders"]
+struct MongoOrder {
+    #[primary_key]
+    id: MongoObjectId,
+    customer_name: String,
+
+    #[has_many(
+        foreign_key = "order_id",
+        references = "id",
+        on_replace = "unlink_missing"
+    )]
+    items: Vec<MongoOrderItem>,
 }
 
 #[derive(Clone, Debug, Entity, SqlEntity)]
@@ -164,4 +197,33 @@ fn derives_mongo_entity_contract() {
     assert_eq!(restored.id(), customer.id());
     assert_eq!(restored.name, customer.name);
     assert_eq!(restored.active, Some(true));
+}
+
+#[test]
+fn derives_mongo_aggregate_contract() {
+    let order = MongoOrder {
+        id: MongoObjectId(ObjectId::new()),
+        customer_name: "Ada".to_string(),
+        items: Vec::new(),
+    };
+
+    assert_eq!(MongoOrder::collection_name(), "mongo_orders");
+    assert_eq!(MongoOrder::relations().len(), 1);
+    assert_eq!(MongoOrder::items().name, "items");
+    assert!(order.items.is_empty());
+}
+
+#[test]
+fn derives_sqlserver_entity_contract() {
+    let category = Category {
+        category_id: 10,
+        name: "Hardware".to_string(),
+    };
+
+    assert_eq!(Category::table_name(), "categories");
+    assert_eq!(Category::primary_key(), "category_id");
+    assert_eq!(Category::fields(), &["category_id", "name"]);
+    assert_eq!(category.id(), &10);
+    assert_eq!(category.to_insert_params().len(), 2);
+    assert_eq!(category.to_update_params().len(), 1);
 }

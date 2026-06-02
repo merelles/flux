@@ -20,7 +20,9 @@ quote = "1"
 flux = { path = "../flux" }
 flux-mongodb = { path = "../flux-mongodb" }
 flux-postgres = { path = "../flux-postgres" }
+flux-sqlserver = { path = "../flux-sqlserver" }
 mongodb = "3"
+tiberius = { version = "0.12", default-features = false, features = ["tds73", "chrono", "rust_decimal"] }
 tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 

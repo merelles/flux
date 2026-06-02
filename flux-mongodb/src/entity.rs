@@ -1,11 +1,20 @@
 use flux::{EntityId, RepositoryError, Result};
-use mongodb::bson::{oid::ObjectId, Bson, Document};
+use mongodb::bson::{oid::ObjectId, Bson, DateTime, Document};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct MongoObjectId(pub ObjectId);
 
 impl EntityId for MongoObjectId {}
+
+impl From<MongoObjectId> for flux::FilterValue {
+    fn from(value: MongoObjectId) -> Self {
+        Self::Backend {
+            type_name: "mongodb.object_id",
+            value: value.0.to_hex(),
+        }
+    }
+}
 
 impl From<ObjectId> for MongoObjectId {
     fn from(value: ObjectId) -> Self {
@@ -210,6 +219,70 @@ where
             Some(value) => value.to_bson(),
             None => Ok(Bson::Null),
         }
+    }
+}
+
+impl MongoField for Bson {
+    fn from_bson(value: Bson) -> Result<Self> {
+        Ok(value)
+    }
+
+    fn to_bson(&self) -> Result<Bson> {
+        Ok(self.clone())
+    }
+}
+
+impl MongoField for Document {
+    fn from_bson(value: Bson) -> Result<Self> {
+        match value {
+            Bson::Document(value) => Ok(value),
+            other => Err(RepositoryError::InvalidData(format!(
+                "expected Document BSON value, got {other:?}"
+            ))),
+        }
+    }
+
+    fn to_bson(&self) -> Result<Bson> {
+        Ok(Bson::Document(self.clone()))
+    }
+}
+
+impl MongoField for DateTime {
+    fn from_bson(value: Bson) -> Result<Self> {
+        match value {
+            Bson::DateTime(value) => Ok(value),
+            other => Err(RepositoryError::InvalidData(format!(
+                "expected DateTime BSON value, got {other:?}"
+            ))),
+        }
+    }
+
+    fn to_bson(&self) -> Result<Bson> {
+        Ok(Bson::DateTime(*self))
+    }
+}
+
+impl<T> MongoField for Vec<T>
+where
+    T: MongoField,
+{
+    fn from_bson(value: Bson) -> Result<Self> {
+        match value {
+            Bson::Array(values) => values
+                .into_iter()
+                .map(T::from_bson)
+                .collect::<Result<Vec<_>>>(),
+            other => Err(RepositoryError::InvalidData(format!(
+                "expected Array BSON value, got {other:?}"
+            ))),
+        }
+    }
+
+    fn to_bson(&self) -> Result<Bson> {
+        self.iter()
+            .map(MongoField::to_bson)
+            .collect::<Result<Vec<_>>>()
+            .map(Bson::Array)
     }
 }
 

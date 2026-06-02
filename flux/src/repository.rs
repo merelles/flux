@@ -1,3 +1,5 @@
+use std::future::Future;
+
 use async_trait::async_trait;
 
 use crate::{AggregateRoot, Entity, EntityId, GenericFilter, Include, Page, PageRequest, Result};
@@ -68,6 +70,83 @@ pub trait Repository<T>:
 where
     T: Entity,
 {
+}
+
+#[async_trait]
+pub trait StreamRepository<T>: ReadRepository<T>
+where
+    T: Entity + 'static,
+{
+    async fn for_each_page<F, Fut>(&self, limit: u32, handler: F) -> Result<()>
+    where
+        F: FnMut(Page<T, T::Id>) -> Fut + Send,
+        Fut: Future<Output = Result<()>> + Send;
+
+    async fn for_each_page_with_filter<F, Fut>(
+        &self,
+        filter: GenericFilter<T>,
+        limit: u32,
+        handler: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Page<T, T::Id>) -> Fut + Send,
+        Fut: Future<Output = Result<()>> + Send;
+}
+
+#[async_trait]
+impl<T, R> StreamRepository<T> for R
+where
+    T: Entity + 'static,
+    R: ReadRepository<T> + Sync,
+{
+    async fn for_each_page<F, Fut>(&self, limit: u32, mut handler: F) -> Result<()>
+    where
+        F: FnMut(Page<T, T::Id>) -> Fut + Send,
+        Fut: Future<Output = Result<()>> + Send,
+    {
+        let mut after = None;
+
+        loop {
+            let page = self.find_page(PageRequest::cursor(limit, after)).await?;
+            after = page.next_cursor.clone();
+            let should_continue = after.is_some();
+            handler(page).await?;
+
+            if !should_continue {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn for_each_page_with_filter<F, Fut>(
+        &self,
+        filter: GenericFilter<T>,
+        limit: u32,
+        mut handler: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Page<T, T::Id>) -> Fut + Send,
+        Fut: Future<Output = Result<()>> + Send,
+    {
+        let mut after = None;
+
+        loop {
+            let page = self
+                .find_page_with_filter(filter.clone(), PageRequest::cursor(limit, after))
+                .await?;
+            after = page.next_cursor.clone();
+            let should_continue = after.is_some();
+            handler(page).await?;
+
+            if !should_continue {
+                break;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl<T, R> Repository<T> for R

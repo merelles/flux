@@ -6,6 +6,7 @@ use flux::{
     Include, Page, PageRequest, ReadRepository, RelationMetadata, RelationRepository,
     RepositoryError, Result, WriteRepository,
 };
+use tokio::sync::Mutex;
 use tokio_postgres::{types::ToSql, Client};
 
 use crate::{filter::quote_path, render_filter, PostgresAggregate, SqlEntity};
@@ -15,6 +16,7 @@ const POSTGRES_MAX_BIND_PARAMS: usize = 60_000;
 
 pub struct PostgresRepository<T: SqlEntity> {
     client: Arc<Client>,
+    transaction_lock: Arc<Mutex<()>>,
     _marker: PhantomData<T>,
 }
 
@@ -22,6 +24,7 @@ impl<T: SqlEntity> Clone for PostgresRepository<T> {
     fn clone(&self) -> Self {
         Self {
             client: Arc::clone(&self.client),
+            transaction_lock: Arc::clone(&self.transaction_lock),
             _marker: PhantomData,
         }
     }
@@ -31,6 +34,15 @@ impl<T: SqlEntity> PostgresRepository<T> {
     pub fn new(client: Arc<Client>) -> Self {
         Self {
             client,
+            transaction_lock: Arc::new(Mutex::new(())),
+            _marker: PhantomData,
+        }
+    }
+
+    fn with_shared_state(client: Arc<Client>, transaction_lock: Arc<Mutex<()>>) -> Self {
+        Self {
+            client,
+            transaction_lock,
             _marker: PhantomData,
         }
     }
@@ -54,7 +66,10 @@ impl<T: SqlEntity> PostgresRepository<T> {
                 metadata.name
             ))
         })?;
-        let child_repo = PostgresRepository::<C>::new(Arc::clone(&self.client));
+        let child_repo = PostgresRepository::<C>::with_shared_state(
+            Arc::clone(&self.client),
+            Arc::clone(&self.transaction_lock),
+        );
         load_all_by_foreign_key(&child_repo, foreign_key, source).await
     }
 
@@ -73,7 +88,10 @@ impl<T: SqlEntity> PostgresRepository<T> {
                 metadata.name
             ))
         })?;
-        let child_repo = PostgresRepository::<C>::new(Arc::clone(&self.client));
+        let child_repo = PostgresRepository::<C>::with_shared_state(
+            Arc::clone(&self.client),
+            Arc::clone(&self.transaction_lock),
+        );
         let page = child_repo
             .find_by_foreign_key(
                 foreign_key,
@@ -101,7 +119,10 @@ impl<T: SqlEntity> PostgresRepository<T> {
                 metadata.name
             ))
         })?;
-        let child_repo = PostgresRepository::<C>::new(Arc::clone(&self.client));
+        let child_repo = PostgresRepository::<C>::with_shared_state(
+            Arc::clone(&self.client),
+            Arc::clone(&self.transaction_lock),
+        );
 
         match mode {
             GraphSaveMode::AppendChildren => {
@@ -111,18 +132,18 @@ impl<T: SqlEntity> PostgresRepository<T> {
                 child_repo.save_many(children).await?;
             }
             GraphSaveMode::ReplaceChildren => {
-                let existing = load_all_by_foreign_key(&child_repo, foreign_key, source).await?;
-                let current_ids = children
-                    .iter()
-                    .map(|child| child.id().clone())
-                    .collect::<HashSet<_>>();
-                let delete_ids = existing
-                    .iter()
-                    .filter(|child| !current_ids.contains(child.id()))
-                    .map(|child| child.id().clone())
-                    .collect::<Vec<_>>();
-
-                child_repo.delete_many(&delete_ids).await?;
+                match metadata.on_replace {
+                    flux::OnReplace::KeepMissing => {}
+                    flux::OnReplace::DeleteMissing => {
+                        let delete_ids =
+                            missing_child_ids(&child_repo, foreign_key, source, children).await?;
+                        child_repo.delete_many(&delete_ids).await?;
+                    }
+                    flux::OnReplace::UnlinkMissing => {
+                        unlink_missing_by_foreign_key(&child_repo, foreign_key, source, children)
+                            .await?;
+                    }
+                }
                 child_repo.save_many(children).await?;
             }
         }
@@ -147,7 +168,10 @@ impl<T: SqlEntity> PostgresRepository<T> {
                 metadata.name
             ))
         })?;
-        let child_repo = PostgresRepository::<C>::new(Arc::clone(&self.client));
+        let child_repo = PostgresRepository::<C>::with_shared_state(
+            Arc::clone(&self.client),
+            Arc::clone(&self.transaction_lock),
+        );
 
         match (mode, child) {
             (GraphSaveMode::AppendChildren, Some(child)) => {
@@ -156,11 +180,17 @@ impl<T: SqlEntity> PostgresRepository<T> {
             (GraphSaveMode::UpsertChildren | GraphSaveMode::ReplaceChildren, Some(child)) => {
                 child_repo.save(child).await?;
             }
-            (GraphSaveMode::ReplaceChildren, None) => {
-                child_repo
-                    .delete_by_foreign_key(foreign_key, source)
-                    .await?;
-            }
+            (GraphSaveMode::ReplaceChildren, None) => match metadata.on_replace {
+                flux::OnReplace::KeepMissing => {}
+                flux::OnReplace::DeleteMissing => {
+                    child_repo
+                        .delete_by_foreign_key(foreign_key, source)
+                        .await?;
+                }
+                flux::OnReplace::UnlinkMissing => {
+                    unlink_all_by_foreign_key(&child_repo, foreign_key, source).await?;
+                }
+            },
             _ => {}
         }
 
@@ -182,7 +212,10 @@ impl<T: SqlEntity> PostgresRepository<T> {
                 metadata.name
             ))
         })?;
-        let child_repo = PostgresRepository::<C>::new(Arc::clone(&self.client));
+        let child_repo = PostgresRepository::<C>::with_shared_state(
+            Arc::clone(&self.client),
+            Arc::clone(&self.transaction_lock),
+        );
         child_repo
             .delete_by_foreign_key(foreign_key, source)
             .await?;
@@ -232,10 +265,15 @@ impl<T: SqlEntity> PostgresRepository<T> {
         C: SqlEntity,
         K: EntityId,
     {
-        let child_repo = PostgresRepository::<C>::new(Arc::clone(&self.client));
+        let child_repo = PostgresRepository::<C>::with_shared_state(
+            Arc::clone(&self.client),
+            Arc::clone(&self.transaction_lock),
+        );
         child_repo.save_many(children).await?;
 
-        if mode == GraphSaveMode::ReplaceChildren {
+        if mode == GraphSaveMode::ReplaceChildren
+            && metadata.on_replace != flux::OnReplace::KeepMissing
+        {
             self.delete_missing_many_to_many_links(metadata, children, source)
                 .await?;
         }
@@ -391,6 +429,9 @@ impl<T: SqlEntity> PostgresRepository<T> {
         }
 
         let limit = page.limit();
+        let total = self
+            .query_count(&table, &where_parts, &owned_params)
+            .await?;
 
         match page {
             PageRequest::Offset { offset, .. } => {
@@ -410,7 +451,7 @@ impl<T: SqlEntity> PostgresRepository<T> {
                     Some(&offset_placeholder),
                 );
                 let rows = self.query_owned(&query, &owned_params).await?;
-                page_from_rows::<T>(rows, limit)
+                page_from_rows::<T>(rows, limit, Some(total))
             }
             PageRequest::Cursor { after, .. } => {
                 if let Some(after) = after {
@@ -429,7 +470,7 @@ impl<T: SqlEntity> PostgresRepository<T> {
                     None,
                 );
                 let rows = self.query_owned(&query, &owned_params).await?;
-                page_from_rows::<T>(rows, limit)
+                page_from_rows::<T>(rows, limit, Some(total))
             }
         }
     }
@@ -473,6 +514,27 @@ impl<T: SqlEntity> PostgresRepository<T> {
             .query(query, refs.as_slice())
             .await
             .map_err(map_error)
+    }
+
+    async fn query_count(
+        &self,
+        table: &str,
+        where_parts: &[String],
+        params: &[Box<dyn ToSql + Sync + Send>],
+    ) -> Result<u64> {
+        let where_clause = if where_parts.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", where_parts.join(" AND "))
+        };
+        let query = format!("SELECT COUNT(*) FROM {table}{where_clause}");
+        let row = self
+            .client
+            .query_one(&query, owned_refs(params).as_slice())
+            .await
+            .map_err(map_error)?;
+        let count: i64 = row.get(0);
+        Ok(count as u64)
     }
 }
 
@@ -811,6 +873,7 @@ where
     }
 
     async fn insert_graph(&self, aggregate: &A) -> Result<A> {
+        let _transaction_guard = self.transaction_lock.lock().await;
         self.begin_transaction().await?;
 
         let saved = match self.insert(aggregate).await {
@@ -831,6 +894,7 @@ where
     }
 
     async fn update_graph(&self, aggregate: &A, mode: GraphSaveMode) -> Result<A> {
+        let _transaction_guard = self.transaction_lock.lock().await;
         self.begin_transaction().await?;
 
         let saved = match self.update(aggregate).await {
@@ -851,6 +915,7 @@ where
     }
 
     async fn save_graph(&self, aggregate: &A, mode: GraphSaveMode) -> Result<A> {
+        let _transaction_guard = self.transaction_lock.lock().await;
         self.begin_transaction().await?;
 
         let saved = match self.save(aggregate).await {
@@ -871,6 +936,7 @@ where
     }
 
     async fn delete_graph(&self, id: &A::Id) -> Result<bool> {
+        let _transaction_guard = self.transaction_lock.lock().await;
         self.begin_transaction().await?;
 
         if let Err(error) = A::delete_relations(self, id).await {
@@ -941,6 +1007,89 @@ where
     Ok(items)
 }
 
+async fn missing_child_ids<C, K>(
+    repository: &PostgresRepository<C>,
+    field: &str,
+    value: &K,
+    children: &[C],
+) -> Result<Vec<C::Id>>
+where
+    C: SqlEntity,
+    K: EntityId,
+{
+    let existing = load_all_by_foreign_key(repository, field, value).await?;
+    let current_ids = children
+        .iter()
+        .map(|child| child.id().clone())
+        .collect::<HashSet<_>>();
+    Ok(existing
+        .iter()
+        .filter(|child| !current_ids.contains(child.id()))
+        .map(|child| child.id().clone())
+        .collect())
+}
+
+async fn unlink_missing_by_foreign_key<C, K>(
+    repository: &PostgresRepository<C>,
+    field: &str,
+    value: &K,
+    children: &[C],
+) -> Result<()>
+where
+    C: SqlEntity,
+    K: EntityId,
+{
+    let table = quote_path(C::table_name())?;
+    let primary_key = quote_path(C::primary_key())?;
+    let field = quote_path(field)?;
+    let mut params = Vec::new();
+    push_entity_id_param(&mut params, value)?;
+
+    let query = if children.is_empty() {
+        format!("UPDATE {table} SET {field} = NULL WHERE {field} = $1")
+    } else {
+        for child in children {
+            push_entity_id_param(&mut params, child.id())?;
+        }
+        let placeholders = (2..=params.len())
+            .map(|index| format!("${index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "UPDATE {table} SET {field} = NULL WHERE {field} = $1 AND {primary_key} NOT IN ({placeholders})"
+        )
+    };
+
+    repository
+        .client
+        .execute(&query, owned_refs(&params).as_slice())
+        .await
+        .map_err(map_error)?;
+    Ok(())
+}
+
+async fn unlink_all_by_foreign_key<C, K>(
+    repository: &PostgresRepository<C>,
+    field: &str,
+    value: &K,
+) -> Result<()>
+where
+    C: SqlEntity,
+    K: EntityId,
+{
+    let table = quote_path(C::table_name())?;
+    let field = quote_path(field)?;
+    let query = format!("UPDATE {table} SET {field} = NULL WHERE {field} = $1");
+    let mut params = Vec::new();
+    push_entity_id_param(&mut params, value)?;
+    repository
+        .client
+        .execute(&query, owned_refs(&params).as_slice())
+        .await
+        .map_err(map_error)?;
+    Ok(())
+}
+
 fn required_relation_part<'a>(
     metadata: &RelationMetadata,
     value: Option<&'a str>,
@@ -954,6 +1103,7 @@ fn required_relation_part<'a>(
 fn page_from_rows<T: SqlEntity>(
     rows: Vec<tokio_postgres::Row>,
     limit: u32,
+    total: Option<u64>,
 ) -> Result<Page<T, T::Id>> {
     let items = rows
         .into_iter()
@@ -964,7 +1114,7 @@ fn page_from_rows<T: SqlEntity>(
     } else {
         None
     };
-    Ok(Page::new(items, limit, next_cursor, None))
+    Ok(Page::new(items, limit, next_cursor, total))
 }
 
 fn collect_insert_params<T: SqlEntity>(entities: &[T]) -> Result<Vec<&(dyn ToSql + Sync)>> {

@@ -1,29 +1,53 @@
 use flux::{
-    FilterExpr, FilterOp, FilterOperand, FilterValue, GenericFilter, RepositoryError, Result,
+    FilterExpr, FilterOp, FilterOperand, FilterValue, GenericFilter, OrderDirection,
+    RepositoryError, Result,
 };
-use mongodb::bson::{Bson, Document};
+use mongodb::bson::{oid::ObjectId, Bson, Document};
+
+pub struct RenderedFilter {
+    pub filter: Document,
+    pub sort: Option<Document>,
+}
 
 pub fn render_filter<T>(filter: &GenericFilter<T>) -> Result<Document> {
+    Ok(render_filter_parts(filter)?.filter)
+}
+
+pub fn render_filter_parts<T>(filter: &GenericFilter<T>) -> Result<RenderedFilter> {
     let mut document = Document::new();
     let expressions = filter.expressions();
 
-    if expressions.is_empty() {
-        return Ok(document);
-    }
-
     if expressions.len() == 1 {
-        return render_expr(&expressions[0]);
+        document = render_expr(&expressions[0])?;
+    } else if !expressions.is_empty() {
+        let clauses = expressions
+            .iter()
+            .map(render_expr)
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .map(Bson::Document)
+            .collect::<Vec<_>>();
+        document.insert("$and", Bson::Array(clauses));
     }
 
-    let clauses = expressions
-        .iter()
-        .map(render_expr)
-        .collect::<Result<Vec<_>>>()?
-        .into_iter()
-        .map(Bson::Document)
-        .collect::<Vec<_>>();
-    document.insert("$and", Bson::Array(clauses));
-    Ok(document)
+    let sort = if filter.order_by_clauses().is_empty() {
+        None
+    } else {
+        let mut sort = Document::new();
+        for clause in filter.order_by_clauses() {
+            let direction = match clause.direction {
+                OrderDirection::Asc => 1,
+                OrderDirection::Desc => -1,
+            };
+            sort.insert(clause.field.clone(), direction);
+        }
+        Some(sort)
+    };
+
+    Ok(RenderedFilter {
+        filter: document,
+        sort,
+    })
 }
 
 fn render_expr(expr: &FilterExpr) -> Result<Document> {
@@ -116,6 +140,17 @@ fn to_bson(value: &FilterValue) -> Result<Bson> {
         FilterValue::F64(value) => Ok(Bson::Double(*value)),
         FilterValue::String(value) => Ok(Bson::String(value.clone())),
         FilterValue::Uuid(value) => Ok(Bson::String(value.to_string())),
+        FilterValue::Backend { type_name, value } if *type_name == "mongodb.object_id" => {
+            let object_id = ObjectId::parse_str(value).map_err(|error| {
+                RepositoryError::InvalidData(format!(
+                    "invalid Mongo ObjectId filter value: {error}"
+                ))
+            })?;
+            Ok(Bson::ObjectId(object_id))
+        }
+        FilterValue::Backend { type_name, .. } => Err(RepositoryError::Unsupported(format!(
+            "unsupported backend-specific filter value for Mongo: {type_name}"
+        ))),
         FilterValue::Null => Ok(Bson::Null),
     }
 }

@@ -2,12 +2,11 @@ use flux::{
     FilterExpr, FilterOp, FilterOperand, FilterValue, GenericFilter, OrderDirection,
     RepositoryError, Result,
 };
-use tokio_postgres::types::ToSql;
 
 pub struct RenderedFilter {
     pub where_clause: Option<String>,
     pub order_by: Option<String>,
-    pub params: Vec<Box<dyn ToSql + Sync + Send>>,
+    pub params: Vec<Box<dyn tiberius::ToSql>>,
 }
 
 pub fn render_filter<T>(filter: &GenericFilter<T>, start_index: usize) -> Result<RenderedFilter> {
@@ -59,7 +58,7 @@ pub(crate) fn quote_path(path: &str) -> Result<String> {
 fn quote_ident(ident: &str) -> Result<String> {
     if ident.is_empty() {
         return Err(RepositoryError::InvalidData(
-            "SQL identifier cannot be empty".to_string(),
+            "SQL Server identifier cannot be empty".to_string(),
         ));
     }
 
@@ -68,16 +67,16 @@ fn quote_ident(ident: &str) -> Result<String> {
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
     {
         return Err(RepositoryError::InvalidData(format!(
-            "Invalid SQL identifier: {ident}"
+            "invalid SQL Server identifier: {ident}"
         )));
     }
 
-    Ok(format!("\"{}\"", ident))
+    Ok(format!("[{ident}]"))
 }
 
 fn render_expr(
     expr: &FilterExpr,
-    params: &mut Vec<Box<dyn ToSql + Sync + Send>>,
+    params: &mut Vec<Box<dyn tiberius::ToSql>>,
     start_index: usize,
 ) -> Result<String> {
     match expr {
@@ -90,19 +89,19 @@ fn render_expr(
                 | (FilterOp::IsNotNull, FilterOperand::None) => Ok(format!("{field} IS NOT NULL")),
                 (FilterOp::In, FilterOperand::Many(values)) => {
                     if values.is_empty() {
-                        return Ok("FALSE".to_string());
+                        return Ok("1 = 0".to_string());
                     }
 
                     let mut placeholders = Vec::with_capacity(values.len());
                     for value in values {
                         push_filter_value(params, value)?;
-                        placeholders.push(format!("${}", start_index + params.len() - 1));
+                        placeholders.push(format!("@P{}", start_index + params.len() - 1));
                     }
                     Ok(format!("{field} IN ({})", placeholders.join(", ")))
                 }
                 (op, FilterOperand::Single(value)) => {
                     push_filter_value(params, value)?;
-                    let placeholder = format!("${}", start_index + params.len() - 1);
+                    let placeholder = format!("@P{}", start_index + params.len() - 1);
                     let sql_op = match op {
                         FilterOp::Eq => "=",
                         FilterOp::Ne => "<>",
@@ -113,14 +112,14 @@ fn render_expr(
                         FilterOp::Like => "LIKE",
                         _ => {
                             return Err(RepositoryError::Unsupported(format!(
-                                "Unsupported filter operator: {op:?}"
+                                "unsupported filter operator: {op:?}"
                             )));
                         }
                     };
                     Ok(format!("{field} {sql_op} {placeholder}"))
                 }
                 _ => Err(RepositoryError::InvalidData(format!(
-                    "Invalid filter operand for {:?}",
+                    "invalid filter operand for {:?}",
                     condition.op
                 ))),
             }
@@ -137,7 +136,7 @@ fn render_expr(
 fn render_group(
     operator: &str,
     items: &[FilterExpr],
-    params: &mut Vec<Box<dyn ToSql + Sync + Send>>,
+    params: &mut Vec<Box<dyn tiberius::ToSql>>,
     start_index: usize,
 ) -> Result<String> {
     let rendered = items
@@ -148,7 +147,7 @@ fn render_group(
 }
 
 fn push_filter_value(
-    params: &mut Vec<Box<dyn ToSql + Sync + Send>>,
+    params: &mut Vec<Box<dyn tiberius::ToSql>>,
     value: &FilterValue,
 ) -> Result<()> {
     match value {
@@ -166,7 +165,7 @@ fn push_filter_value(
         FilterValue::Uuid(value) => params.push(Box::new(*value)),
         FilterValue::Backend { type_name, .. } => {
             return Err(RepositoryError::Unsupported(format!(
-                "unsupported backend-specific filter value for Postgres: {type_name}"
+                "unsupported backend-specific filter value for SQL Server: {type_name}"
             )));
         }
         FilterValue::Null => {

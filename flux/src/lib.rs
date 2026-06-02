@@ -19,5 +19,5 @@ pub use self::filter::{
 pub use self::page::{Page, PageRequest};
 pub use self::repository::{
     AggregateRepository, BulkRepository, GraphSaveMode, ReadRepository, RelationRepository,
-    Repository, WriteRepository,
+    Repository, StreamRepository, WriteRepository,
 };
