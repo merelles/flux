@@ -1,6 +1,6 @@
 use flux::{AggregateRoot as _, Entity as _, RelationKind};
-use flux_derive::{AggregateRoot, Entity, MongoEntity, SqlEntity, SqlServerEntity};
-use flux_mongodb::{MongoEntity as _, MongoObjectId};
+use flux_derive::{AggregateRoot, Entity, MongoEmbedded, MongoEntity, SqlEntity, SqlServerEntity};
+use flux_mongodb::{MongoEmbedded as _, MongoEntity as _, MongoObjectId};
 use flux_postgres::SqlEntity as _;
 use flux_sqlserver::SqlServerEntity as _;
 use mongodb::bson::oid::ObjectId;
@@ -22,6 +22,31 @@ struct Category {
     #[primary_key]
     category_id: i64,
     name: String,
+}
+
+#[derive(Clone, Debug, Entity, SqlServerEntity)]
+#[table_name = "sqlserver_order_items"]
+struct SqlServerOrderItem {
+    #[primary_key]
+    item_oid: Uuid,
+    order_oid: Uuid,
+    product_name: String,
+}
+
+#[derive(Clone, Debug, Entity, SqlServerEntity, AggregateRoot)]
+#[table_name = "sqlserver_orders"]
+struct SqlServerOrder {
+    #[primary_key]
+    order_oid: Uuid,
+    customer_name: String,
+
+    #[has_many(
+        foreign_key = "order_oid",
+        references = "order_oid",
+        on_replace = "delete_missing",
+        cascade_delete
+    )]
+    items: Vec<SqlServerOrderItem>,
 }
 
 #[derive(Clone, Debug, Entity, SqlEntity, AggregateRoot)]
@@ -72,6 +97,21 @@ struct MongoOrder {
         on_replace = "unlink_missing"
     )]
     items: Vec<MongoOrderItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, MongoEmbedded)]
+struct EmbeddedLine {
+    sku: String,
+    quantity: i32,
+}
+
+#[derive(Clone, Debug, Entity, MongoEntity)]
+#[collection_name = "mongo_carts"]
+struct MongoCart {
+    #[primary_key]
+    id: MongoObjectId,
+    customer_name: String,
+    lines: Vec<EmbeddedLine>,
 }
 
 #[derive(Clone, Debug, Entity, SqlEntity)]
@@ -214,6 +254,30 @@ fn derives_mongo_aggregate_contract() {
 }
 
 #[test]
+fn derives_mongo_embedded_contract() {
+    let line = EmbeddedLine {
+        sku: "SKU-1".to_string(),
+        quantity: 2,
+    };
+    let document = line.to_document().expect("embedded document");
+    assert_eq!(document.get_str("sku").expect("sku"), "SKU-1");
+    assert_eq!(document.get_i32("quantity").expect("quantity"), 2);
+
+    let cart = MongoCart {
+        id: MongoObjectId(ObjectId::new()),
+        customer_name: "Ada".to_string(),
+        lines: vec![line.clone()],
+    };
+
+    let document = cart.to_document().expect("cart document");
+    let lines = document.get_array("lines").expect("lines");
+    assert_eq!(lines.len(), 1);
+
+    let restored = MongoCart::from_document(document).expect("restored cart");
+    assert_eq!(restored.lines, vec![line]);
+}
+
+#[test]
 fn derives_sqlserver_entity_contract() {
     let category = Category {
         category_id: 10,
@@ -226,4 +290,18 @@ fn derives_sqlserver_entity_contract() {
     assert_eq!(category.id(), &10);
     assert_eq!(category.to_insert_params().len(), 2);
     assert_eq!(category.to_update_params().len(), 1);
+}
+
+#[test]
+fn derives_sqlserver_aggregate_contract() {
+    let order = SqlServerOrder {
+        order_oid: Uuid::new_v4(),
+        customer_name: "Ada".to_string(),
+        items: Vec::new(),
+    };
+
+    assert_eq!(SqlServerOrder::table_name(), "sqlserver_orders");
+    assert_eq!(SqlServerOrder::relations().len(), 1);
+    assert_eq!(SqlServerOrder::items().name, "items");
+    assert!(order.items.is_empty());
 }

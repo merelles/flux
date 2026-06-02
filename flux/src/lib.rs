@@ -18,6 +18,6 @@ pub use self::filter::{
 };
 pub use self::page::{Page, PageRequest};
 pub use self::repository::{
-    AggregateRepository, BulkRepository, GraphSaveMode, ReadRepository, RelationRepository,
-    Repository, StreamRepository, WriteRepository,
+    AggregateRepository, BulkRepository, GraphSaveMode, PageStream, ReadRepository,
+    RelationRepository, Repository, StreamRepository, WriteRepository,
 };

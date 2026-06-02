@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{future::Future, marker::PhantomData, pin::Pin};
 
 use async_trait::async_trait;
 use flux::{
@@ -9,12 +9,14 @@ use flux::{
 use futures_util::TryStreamExt;
 use mongodb::{
     bson::{Bson, Document},
-    Collection, Database,
+    ClientSession, Collection, Database,
 };
 
 use crate::{entity::unsupported_id, render_filter_parts, MongoAggregate, MongoEntity, MongoId};
 
 const DEFAULT_RELATION_PAGE_LIMIT: u32 = 512;
+
+pub type MongoTransactionFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 
 pub struct MongoRepository<T: MongoEntity> {
     database: Database,
@@ -40,6 +42,40 @@ impl<T: MongoEntity> MongoRepository<T> {
 
     pub fn collection(&self) -> Collection<Document> {
         self.database.collection::<Document>(T::collection_name())
+    }
+
+    pub fn database(&self) -> &Database {
+        &self.database
+    }
+
+    pub async fn with_transaction<R, F>(&self, operation: F) -> Result<R>
+    where
+        R: Send,
+        F: for<'session> FnOnce(&'session mut ClientSession) -> MongoTransactionFuture<'session, R>
+            + Send,
+    {
+        let mut session = self
+            .database
+            .client()
+            .start_session()
+            .await
+            .map_err(map_error)?;
+        session.start_transaction().await.map_err(map_error)?;
+
+        match operation(&mut session).await {
+            Ok(value) => {
+                session.commit_transaction().await.map_err(map_error)?;
+                Ok(value)
+            }
+            Err(error) => {
+                if let Err(abort_error) = session.abort_transaction().await.map_err(map_error) {
+                    return Err(RepositoryError::OperationFailed(format!(
+                        "transaction failed: {error}; abort failed: {abort_error}"
+                    )));
+                }
+                Err(error)
+            }
+        }
     }
 
     pub async fn load_has_many<C, K>(

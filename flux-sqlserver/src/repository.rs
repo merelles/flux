@@ -1,16 +1,18 @@
-use std::{any::Any, marker::PhantomData, sync::Arc};
+use std::{any::Any, collections::HashSet, marker::PhantomData, sync::Arc};
 
 use async_trait::async_trait;
 use flux::{
-    BulkRepository, EntityId, GenericFilter, Page, PageRequest, ReadRepository, RelationRepository,
+    AggregateRepository, BulkRepository, CascadeAction, EntityId, GenericFilter, GraphSaveMode,
+    Include, Page, PageRequest, ReadRepository, RelationMetadata, RelationRepository,
     RepositoryError, Result, WriteRepository,
 };
 use futures_util::io::{AsyncRead, AsyncWrite};
 use tiberius::Client;
 use tokio::sync::Mutex;
 
-use crate::{filter::quote_path, render_filter, SqlServerEntity};
+use crate::{filter::quote_path, render_filter, SqlServerAggregate, SqlServerEntity};
 
+const DEFAULT_RELATION_PAGE_LIMIT: u32 = 512;
 const SQLSERVER_MAX_BIND_PARAMS: usize = 2_000;
 
 pub struct SqlServerRepository<T, S>
@@ -19,6 +21,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     client: Arc<Mutex<Client<S>>>,
+    transaction_lock: Arc<Mutex<()>>,
     _marker: PhantomData<T>,
 }
 
@@ -30,6 +33,7 @@ where
     fn clone(&self) -> Self {
         Self {
             client: Arc::clone(&self.client),
+            transaction_lock: Arc::clone(&self.transaction_lock),
             _marker: PhantomData,
         }
     }
@@ -43,12 +47,371 @@ where
     pub fn new(client: Arc<Mutex<Client<S>>>) -> Self {
         Self {
             client,
+            transaction_lock: Arc::new(Mutex::new(())),
+            _marker: PhantomData,
+        }
+    }
+
+    fn with_shared_state(client: Arc<Mutex<Client<S>>>, transaction_lock: Arc<Mutex<()>>) -> Self {
+        Self {
+            client,
+            transaction_lock,
             _marker: PhantomData,
         }
     }
 
     pub fn client(&self) -> &Arc<Mutex<Client<S>>> {
         &self.client
+    }
+
+    pub async fn load_has_many<C, K>(
+        &self,
+        metadata: &RelationMetadata,
+        source: &K,
+    ) -> Result<Vec<C>>
+    where
+        C: SqlServerEntity,
+        K: EntityId,
+        S: Sync,
+    {
+        let foreign_key = metadata.foreign_key.ok_or_else(|| {
+            RepositoryError::InvalidData(format!(
+                "relation {} is missing foreign_key",
+                metadata.name
+            ))
+        })?;
+        let child_repo = SqlServerRepository::<C, S>::with_shared_state(
+            Arc::clone(&self.client),
+            Arc::clone(&self.transaction_lock),
+        );
+        load_all_by_foreign_key(&child_repo, foreign_key, source).await
+    }
+
+    pub async fn load_has_one<C, K>(
+        &self,
+        metadata: &RelationMetadata,
+        source: &K,
+    ) -> Result<Option<C>>
+    where
+        C: SqlServerEntity,
+        K: EntityId,
+        S: Sync,
+    {
+        let foreign_key = metadata.foreign_key.ok_or_else(|| {
+            RepositoryError::InvalidData(format!(
+                "relation {} is missing foreign_key",
+                metadata.name
+            ))
+        })?;
+        let child_repo = SqlServerRepository::<C, S>::with_shared_state(
+            Arc::clone(&self.client),
+            Arc::clone(&self.transaction_lock),
+        );
+        let page = child_repo
+            .find_by_foreign_key(
+                foreign_key,
+                source,
+                PageRequest::cursor(1, Option::<C::Id>::None),
+            )
+            .await?;
+        Ok(page.items.into_iter().next())
+    }
+
+    pub async fn save_has_many<C, K>(
+        &self,
+        metadata: &RelationMetadata,
+        children: &[C],
+        source: &K,
+        mode: GraphSaveMode,
+    ) -> Result<()>
+    where
+        C: SqlServerEntity,
+        K: EntityId,
+        S: Sync,
+    {
+        let foreign_key = metadata.foreign_key.ok_or_else(|| {
+            RepositoryError::InvalidData(format!(
+                "relation {} is missing foreign_key",
+                metadata.name
+            ))
+        })?;
+        let child_repo = SqlServerRepository::<C, S>::with_shared_state(
+            Arc::clone(&self.client),
+            Arc::clone(&self.transaction_lock),
+        );
+
+        match mode {
+            GraphSaveMode::AppendChildren => {
+                child_repo.insert_many(children).await?;
+            }
+            GraphSaveMode::UpsertChildren => {
+                child_repo.save_many(children).await?;
+            }
+            GraphSaveMode::ReplaceChildren => {
+                match metadata.on_replace {
+                    flux::OnReplace::KeepMissing => {}
+                    flux::OnReplace::DeleteMissing => {
+                        let delete_ids =
+                            missing_child_ids(&child_repo, foreign_key, source, children).await?;
+                        child_repo.delete_many(&delete_ids).await?;
+                    }
+                    flux::OnReplace::UnlinkMissing => {
+                        unlink_missing_by_foreign_key(&child_repo, foreign_key, source, children)
+                            .await?;
+                    }
+                }
+                child_repo.save_many(children).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn save_has_one<C, K>(
+        &self,
+        metadata: &RelationMetadata,
+        child: Option<&C>,
+        source: &K,
+        mode: GraphSaveMode,
+    ) -> Result<()>
+    where
+        C: SqlServerEntity,
+        K: EntityId,
+        S: Sync,
+    {
+        let foreign_key = metadata.foreign_key.ok_or_else(|| {
+            RepositoryError::InvalidData(format!(
+                "relation {} is missing foreign_key",
+                metadata.name
+            ))
+        })?;
+        let child_repo = SqlServerRepository::<C, S>::with_shared_state(
+            Arc::clone(&self.client),
+            Arc::clone(&self.transaction_lock),
+        );
+
+        match (mode, child) {
+            (GraphSaveMode::AppendChildren, Some(child)) => {
+                child_repo.insert(child).await?;
+            }
+            (GraphSaveMode::UpsertChildren | GraphSaveMode::ReplaceChildren, Some(child)) => {
+                child_repo.save(child).await?;
+            }
+            (GraphSaveMode::ReplaceChildren, None) => match metadata.on_replace {
+                flux::OnReplace::KeepMissing => {}
+                flux::OnReplace::DeleteMissing => {
+                    child_repo
+                        .delete_by_foreign_key(foreign_key, source)
+                        .await?;
+                }
+                flux::OnReplace::UnlinkMissing => {
+                    unlink_all_by_foreign_key(&child_repo, foreign_key, source).await?;
+                }
+            },
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    pub async fn delete_relation<C, K>(&self, metadata: &RelationMetadata, source: &K) -> Result<()>
+    where
+        C: SqlServerEntity,
+        K: EntityId,
+        S: Sync,
+    {
+        if metadata.cascade != CascadeAction::Delete {
+            return Ok(());
+        }
+
+        let foreign_key = metadata.foreign_key.ok_or_else(|| {
+            RepositoryError::InvalidData(format!(
+                "relation {} is missing foreign_key",
+                metadata.name
+            ))
+        })?;
+        let child_repo = SqlServerRepository::<C, S>::with_shared_state(
+            Arc::clone(&self.client),
+            Arc::clone(&self.transaction_lock),
+        );
+        child_repo
+            .delete_by_foreign_key(foreign_key, source)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn load_many_to_many<C, K>(
+        &self,
+        metadata: &RelationMetadata,
+        source: &K,
+    ) -> Result<Vec<C>>
+    where
+        C: SqlServerEntity,
+        K: EntityId,
+    {
+        let join_table = required_relation_part(metadata, metadata.join_table, "join_table")?;
+        let source_key = required_relation_part(metadata, metadata.source_key, "source_key")?;
+        let target_key = required_relation_part(metadata, metadata.target_key, "target_key")?;
+        let target_primary_key = metadata.target_primary_key.unwrap_or_else(C::primary_key);
+
+        let target_table = quote_path(C::table_name())?;
+        let join_table = quote_path(join_table)?;
+        let source_key = quote_path(source_key)?;
+        let target_key = quote_path(target_key)?;
+        let target_primary_key = quote_path(target_primary_key)?;
+        let query = format!(
+            "SELECT target.* FROM {target_table} AS target INNER JOIN {join_table} AS join_table ON target.{target_primary_key} = join_table.{target_key} WHERE join_table.{source_key} = @P1 ORDER BY target.{target_primary_key} ASC"
+        );
+        let mut params = Vec::new();
+        push_entity_id_param(&mut params, source)?;
+        let rows = self.query_owned(&query, &params).await?;
+        rows.into_iter().map(C::from_row).collect()
+    }
+
+    pub async fn save_many_to_many<C, K>(
+        &self,
+        metadata: &RelationMetadata,
+        children: &[C],
+        source: &K,
+        mode: GraphSaveMode,
+    ) -> Result<()>
+    where
+        C: SqlServerEntity,
+        K: EntityId,
+        S: Sync,
+    {
+        let child_repo = SqlServerRepository::<C, S>::with_shared_state(
+            Arc::clone(&self.client),
+            Arc::clone(&self.transaction_lock),
+        );
+        child_repo.save_many(children).await?;
+
+        if mode == GraphSaveMode::ReplaceChildren
+            && metadata.on_replace != flux::OnReplace::KeepMissing
+        {
+            self.delete_missing_many_to_many_links(metadata, children, source)
+                .await?;
+        }
+
+        self.insert_many_to_many_links(metadata, children, source)
+            .await
+    }
+
+    pub async fn delete_many_to_many_links<K>(
+        &self,
+        metadata: &RelationMetadata,
+        source: &K,
+    ) -> Result<()>
+    where
+        K: EntityId,
+    {
+        let join_table = quote_path(required_relation_part(
+            metadata,
+            metadata.join_table,
+            "join_table",
+        )?)?;
+        let source_key = quote_path(required_relation_part(
+            metadata,
+            metadata.source_key,
+            "source_key",
+        )?)?;
+        let query = format!("DELETE FROM {join_table} WHERE {source_key} = @P1");
+        let mut params = Vec::new();
+        push_entity_id_param(&mut params, source)?;
+        self.execute_owned(&query, &params).await?;
+        Ok(())
+    }
+
+    async fn delete_missing_many_to_many_links<C, K>(
+        &self,
+        metadata: &RelationMetadata,
+        children: &[C],
+        source: &K,
+    ) -> Result<()>
+    where
+        C: SqlServerEntity,
+        K: EntityId,
+    {
+        let join_table = quote_path(required_relation_part(
+            metadata,
+            metadata.join_table,
+            "join_table",
+        )?)?;
+        let source_key = quote_path(required_relation_part(
+            metadata,
+            metadata.source_key,
+            "source_key",
+        )?)?;
+        let target_key = quote_path(required_relation_part(
+            metadata,
+            metadata.target_key,
+            "target_key",
+        )?)?;
+
+        let mut params = Vec::new();
+        push_entity_id_param(&mut params, source)?;
+
+        let query = if children.is_empty() {
+            format!("DELETE FROM {join_table} WHERE {source_key} = @P1")
+        } else {
+            for child in children {
+                push_entity_id_param(&mut params, child.id())?;
+            }
+            let placeholders = (2..=params.len())
+                .map(|index| format!("@P{index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "DELETE FROM {join_table} WHERE {source_key} = @P1 AND {target_key} NOT IN ({placeholders})"
+            )
+        };
+
+        self.execute_owned(&query, &params).await?;
+        Ok(())
+    }
+
+    async fn insert_many_to_many_links<C, K>(
+        &self,
+        metadata: &RelationMetadata,
+        children: &[C],
+        source: &K,
+    ) -> Result<()>
+    where
+        C: SqlServerEntity,
+        K: EntityId,
+    {
+        if children.is_empty() {
+            return Ok(());
+        }
+
+        let join_table = quote_path(required_relation_part(
+            metadata,
+            metadata.join_table,
+            "join_table",
+        )?)?;
+        let source_key = quote_path(required_relation_part(
+            metadata,
+            metadata.source_key,
+            "source_key",
+        )?)?;
+        let target_key = quote_path(required_relation_part(
+            metadata,
+            metadata.target_key,
+            "target_key",
+        )?)?;
+
+        let values = values_clause(2, children.len(), 1);
+        let query = format!(
+            "MERGE INTO {join_table} AS target USING (VALUES {values}) AS source ({source_key}, {target_key}) ON target.{source_key} = source.{source_key} AND target.{target_key} = source.{target_key} WHEN NOT MATCHED THEN INSERT ({source_key}, {target_key}) VALUES (source.{source_key}, source.{target_key});"
+        );
+        let mut params = Vec::with_capacity(children.len() * 2);
+        for child in children {
+            push_entity_id_param(&mut params, source)?;
+            push_entity_id_param(&mut params, child.id())?;
+        }
+
+        self.execute_owned(&query, &params).await?;
+        Ok(())
     }
 
     async fn query_page(
@@ -180,6 +543,44 @@ where
             .get::<i64, _>("count")
             .ok_or_else(|| RepositoryError::InvalidData("invalid count result".to_string()))?;
         Ok(count as u64)
+    }
+
+    async fn execute_simple(&self, query: &str) -> Result<()> {
+        let mut client = self.client.lock().await;
+        client
+            .simple_query(query)
+            .await
+            .map_err(map_error)?
+            .into_results()
+            .await
+            .map_err(map_error)?;
+        Ok(())
+    }
+
+    async fn begin_transaction(&self) -> Result<()> {
+        self.execute_simple("BEGIN TRANSACTION").await
+    }
+
+    async fn commit_transaction(&self) -> Result<()> {
+        self.execute_simple("COMMIT TRANSACTION").await
+    }
+
+    async fn rollback_transaction(&self) -> Result<()> {
+        self.execute_simple("ROLLBACK TRANSACTION").await
+    }
+
+    async fn reload_all_relations(&self, id: &T::Id) -> Result<T>
+    where
+        T: SqlServerAggregate,
+        S: Sync,
+    {
+        let mut aggregate = self.find_by_id(id).await?;
+        let includes = T::relations()
+            .iter()
+            .map(|relation| Include::new(relation.name))
+            .collect::<Vec<_>>();
+        T::load_relations(self, &mut aggregate, &includes).await?;
+        Ok(aggregate)
     }
 }
 
@@ -453,6 +854,103 @@ where
     }
 }
 
+#[async_trait]
+impl<A, S> AggregateRepository<A> for SqlServerRepository<A, S>
+where
+    A: SqlServerAggregate,
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
+{
+    async fn find_graph_by_id(&self, id: &A::Id, includes: &[Include<A>]) -> Result<A> {
+        let mut aggregate = self.find_by_id(id).await?;
+        A::load_relations(self, &mut aggregate, includes).await?;
+        Ok(aggregate)
+    }
+
+    async fn insert_graph(&self, aggregate: &A) -> Result<A> {
+        let _transaction_guard = self.transaction_lock.lock().await;
+        self.begin_transaction().await?;
+
+        let saved = match self.insert(aggregate).await {
+            Ok(saved) => saved,
+            Err(error) => {
+                self.rollback_transaction().await?;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = A::insert_relations(self, aggregate).await {
+            self.rollback_transaction().await?;
+            return Err(error);
+        }
+
+        self.commit_transaction().await?;
+        self.reload_all_relations(saved.id()).await
+    }
+
+    async fn update_graph(&self, aggregate: &A, mode: GraphSaveMode) -> Result<A> {
+        let _transaction_guard = self.transaction_lock.lock().await;
+        self.begin_transaction().await?;
+
+        let saved = match self.update(aggregate).await {
+            Ok(saved) => saved,
+            Err(error) => {
+                self.rollback_transaction().await?;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = A::update_relations(self, aggregate, mode).await {
+            self.rollback_transaction().await?;
+            return Err(error);
+        }
+
+        self.commit_transaction().await?;
+        self.reload_all_relations(saved.id()).await
+    }
+
+    async fn save_graph(&self, aggregate: &A, mode: GraphSaveMode) -> Result<A> {
+        let _transaction_guard = self.transaction_lock.lock().await;
+        self.begin_transaction().await?;
+
+        let saved = match self.save(aggregate).await {
+            Ok(saved) => saved,
+            Err(error) => {
+                self.rollback_transaction().await?;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = A::update_relations(self, aggregate, mode).await {
+            self.rollback_transaction().await?;
+            return Err(error);
+        }
+
+        self.commit_transaction().await?;
+        self.reload_all_relations(saved.id()).await
+    }
+
+    async fn delete_graph(&self, id: &A::Id) -> Result<bool> {
+        let _transaction_guard = self.transaction_lock.lock().await;
+        self.begin_transaction().await?;
+
+        if let Err(error) = A::delete_relations(self, id).await {
+            self.rollback_transaction().await?;
+            return Err(error);
+        }
+
+        let deleted = match self.delete(id).await {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                self.rollback_transaction().await?;
+                return Err(error);
+            }
+        };
+
+        self.commit_transaction().await?;
+        Ok(deleted)
+    }
+}
+
 fn build_select_query(
     table: &str,
     where_parts: &[String],
@@ -468,6 +966,127 @@ fn build_select_query(
     format!(
         "SELECT * FROM {table}{where_clause} ORDER BY {order_by} OFFSET {offset_placeholder} ROWS FETCH NEXT {limit_placeholder} ROWS ONLY"
     )
+}
+
+async fn load_all_by_foreign_key<C, K, S>(
+    repository: &SqlServerRepository<C, S>,
+    field: &str,
+    value: &K,
+) -> Result<Vec<C>>
+where
+    C: SqlServerEntity,
+    K: EntityId,
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
+{
+    let mut items = Vec::new();
+    let mut after = None;
+
+    loop {
+        let page = repository
+            .find_by_foreign_key(
+                field,
+                value,
+                PageRequest::cursor(DEFAULT_RELATION_PAGE_LIMIT, after),
+            )
+            .await?;
+        let next_cursor = page.next_cursor;
+        items.extend(page.items);
+
+        if next_cursor.is_none() {
+            break;
+        }
+        after = next_cursor;
+    }
+
+    Ok(items)
+}
+
+async fn missing_child_ids<C, K, S>(
+    repository: &SqlServerRepository<C, S>,
+    field: &str,
+    value: &K,
+    children: &[C],
+) -> Result<Vec<C::Id>>
+where
+    C: SqlServerEntity,
+    K: EntityId,
+    S: AsyncRead + AsyncWrite + Unpin + Send + Sync,
+{
+    let existing = load_all_by_foreign_key(repository, field, value).await?;
+    let current_ids = children
+        .iter()
+        .map(|child| child.id().clone())
+        .collect::<HashSet<_>>();
+    Ok(existing
+        .iter()
+        .filter(|child| !current_ids.contains(child.id()))
+        .map(|child| child.id().clone())
+        .collect())
+}
+
+async fn unlink_missing_by_foreign_key<C, K, S>(
+    repository: &SqlServerRepository<C, S>,
+    field: &str,
+    value: &K,
+    children: &[C],
+) -> Result<()>
+where
+    C: SqlServerEntity,
+    K: EntityId,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = quote_path(C::table_name())?;
+    let primary_key = quote_path(C::primary_key())?;
+    let field = quote_path(field)?;
+    let mut params = Vec::new();
+    push_entity_id_param(&mut params, value)?;
+
+    let query = if children.is_empty() {
+        format!("UPDATE {table} SET {field} = NULL WHERE {field} = @P1")
+    } else {
+        for child in children {
+            push_entity_id_param(&mut params, child.id())?;
+        }
+        let placeholders = (2..=params.len())
+            .map(|index| format!("@P{index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "UPDATE {table} SET {field} = NULL WHERE {field} = @P1 AND {primary_key} NOT IN ({placeholders})"
+        )
+    };
+
+    repository.execute_owned(&query, &params).await?;
+    Ok(())
+}
+
+async fn unlink_all_by_foreign_key<C, K, S>(
+    repository: &SqlServerRepository<C, S>,
+    field: &str,
+    value: &K,
+) -> Result<()>
+where
+    C: SqlServerEntity,
+    K: EntityId,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = quote_path(C::table_name())?;
+    let field = quote_path(field)?;
+    let query = format!("UPDATE {table} SET {field} = NULL WHERE {field} = @P1");
+    let mut params = Vec::new();
+    push_entity_id_param(&mut params, value)?;
+    repository.execute_owned(&query, &params).await?;
+    Ok(())
+}
+
+fn required_relation_part<'a>(
+    metadata: &RelationMetadata,
+    value: Option<&'a str>,
+    name: &str,
+) -> Result<&'a str> {
+    value.ok_or_else(|| {
+        RepositoryError::InvalidData(format!("relation {} is missing {name}", metadata.name))
+    })
 }
 
 fn page_from_rows<T: SqlServerEntity>(

@@ -1,5 +1,5 @@
 use flux::{EntityId, RepositoryError, Result};
-use mongodb::bson::{oid::ObjectId, Bson, DateTime, Document};
+use mongodb::bson::{oid::ObjectId, Bson, DateTime, Decimal128, Document};
 use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -69,6 +69,12 @@ pub trait MongoEntity: flux::Entity {
         "_id"
     }
 
+    fn from_document(document: Document) -> Result<Self>;
+
+    fn to_document(&self) -> Result<Document>;
+}
+
+pub trait MongoEmbedded: Sized {
     fn from_document(document: Document) -> Result<Self>;
 
     fn to_document(&self) -> Result<Document>;
@@ -247,6 +253,24 @@ impl MongoField for Document {
     }
 }
 
+impl<T> MongoField for T
+where
+    T: MongoEmbedded,
+{
+    fn from_bson(value: Bson) -> Result<Self> {
+        match value {
+            Bson::Document(value) => T::from_document(value),
+            other => Err(RepositoryError::InvalidData(format!(
+                "expected embedded document BSON value, got {other:?}"
+            ))),
+        }
+    }
+
+    fn to_bson(&self) -> Result<Bson> {
+        self.to_document().map(Bson::Document)
+    }
+}
+
 impl MongoField for DateTime {
     fn from_bson(value: Bson) -> Result<Self> {
         match value {
@@ -259,6 +283,21 @@ impl MongoField for DateTime {
 
     fn to_bson(&self) -> Result<Bson> {
         Ok(Bson::DateTime(*self))
+    }
+}
+
+impl MongoField for Decimal128 {
+    fn from_bson(value: Bson) -> Result<Self> {
+        match value {
+            Bson::Decimal128(value) => Ok(value),
+            other => Err(RepositoryError::InvalidData(format!(
+                "expected Decimal128 BSON value, got {other:?}"
+            ))),
+        }
+    }
+
+    fn to_bson(&self) -> Result<Bson> {
+        Ok(Bson::Decimal128(*self))
     }
 }
 

@@ -1,8 +1,13 @@
-use std::future::Future;
+use std::{future::Future, pin::Pin};
 
 use async_trait::async_trait;
+use futures_core::Stream;
 
 use crate::{AggregateRoot, Entity, EntityId, GenericFilter, Include, Page, PageRequest, Result};
+
+#[allow(type_alias_bounds)]
+pub type PageStream<'a, T: Entity> =
+    Pin<Box<dyn Stream<Item = Result<Page<T, <T as Entity>::Id>>> + Send + 'a>>;
 
 #[async_trait]
 pub trait ReadRepository<T: Entity>: Send + Sync {
@@ -75,8 +80,12 @@ where
 #[async_trait]
 pub trait StreamRepository<T>: ReadRepository<T>
 where
-    T: Entity + 'static,
+    T: Entity,
 {
+    fn page_stream(&self, limit: u32) -> PageStream<'_, T>;
+
+    fn page_stream_with_filter(&self, filter: GenericFilter<T>, limit: u32) -> PageStream<'_, T>;
+
     async fn for_each_page<F, Fut>(&self, limit: u32, handler: F) -> Result<()>
     where
         F: FnMut(Page<T, T::Id>) -> Fut + Send,
@@ -99,6 +108,42 @@ where
     T: Entity + 'static,
     R: ReadRepository<T> + Sync,
 {
+    fn page_stream(&self, limit: u32) -> PageStream<'_, T> {
+        Box::pin(async_stream::try_stream! {
+            let mut after = None;
+
+            loop {
+                let page = self.find_page(PageRequest::cursor(limit, after)).await?;
+                after = page.next_cursor.clone();
+                let should_continue = after.is_some();
+                yield page;
+
+                if !should_continue {
+                    break;
+                }
+            }
+        })
+    }
+
+    fn page_stream_with_filter(&self, filter: GenericFilter<T>, limit: u32) -> PageStream<'_, T> {
+        Box::pin(async_stream::try_stream! {
+            let mut after = None;
+
+            loop {
+                let page = self
+                    .find_page_with_filter(filter.clone(), PageRequest::cursor(limit, after))
+                    .await?;
+                after = page.next_cursor.clone();
+                let should_continue = after.is_some();
+                yield page;
+
+                if !should_continue {
+                    break;
+                }
+            }
+        })
+    }
+
     async fn for_each_page<F, Fut>(&self, limit: u32, mut handler: F) -> Result<()>
     where
         F: FnMut(Page<T, T::Id>) -> Fut + Send,
