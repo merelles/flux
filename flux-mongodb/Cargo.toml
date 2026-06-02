@@ -1,0 +1,16 @@
+[package]
+name = "flux-mongodb"
+version = "0.1.0"
+edition = "2021"
+authors.workspace = true
+homepage.workspace = true
+license.workspace = true
+description = "MongoDB adapter for flux"
+repository.workspace = true
+
+[dependencies]
+async-trait = "0.1.87"
+flux = { path = "../flux" }
+futures-util = "0.3"
+mongodb = "3"
+uuid = { version = "1", features = ["v4", "serde"] }

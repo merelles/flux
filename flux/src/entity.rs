@@ -1,4 +1,4 @@
-use std::fmt::Debug;
+use std::{any::Any, fmt::Debug};
 
 /// Core entity contract shared by all backend adapters.
 /// Backend-specific crates own table/document mapping.
@@ -13,7 +13,7 @@ pub trait Entity: Send + Sync + Sized + Clone {
 }
 
 /// Identifier types accepted by the core repository contracts.
-pub trait EntityId: Clone + Debug + Send + Sync + Eq + 'static {}
+pub trait EntityId: Any + Clone + Debug + Send + Sync + Eq + 'static {}
 
 macro_rules! impl_entity_id {
     ($($ty:ty),* $(,)?) => {

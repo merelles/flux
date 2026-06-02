@@ -1,5 +1,5 @@
 [workspace]
-members = ["flux", "flux-derive"]
+members = ["flux", "flux-derive", "flux-postgres", "flux-mongodb"]
 resolver = "2"
 
 [workspace.package]
