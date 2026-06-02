@@ -101,12 +101,20 @@ where
         self.query_page(Document::new(), page).await
     }
 
-    async fn find_all_with_filter(
+    async fn find_page_with_filter(
         &self,
         filter: GenericFilter<T>,
         page: PageRequest<T::Id>,
     ) -> Result<Page<T, T::Id>> {
         self.query_page(render_filter(&filter)?, page).await
+    }
+
+    async fn find_all_with_filter(
+        &self,
+        filter: GenericFilter<T>,
+        page: PageRequest<T::Id>,
+    ) -> Result<Page<T, T::Id>> {
+        self.find_page_with_filter(filter, page).await
     }
 
     async fn exists(&self, id: &T::Id) -> Result<bool> {
@@ -198,19 +206,38 @@ where
     }
 
     async fn update_many(&self, entities: &[T]) -> Result<Vec<T>> {
-        let mut saved = Vec::with_capacity(entities.len());
-        for entity in entities {
-            saved.push(self.update(entity).await?);
+        if entities.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(saved)
+
+        let models = self.replace_models(entities, false)?;
+        let result = self
+            .database
+            .client()
+            .bulk_write(models)
+            .await
+            .map_err(map_error)?;
+
+        if result.matched_count < entities.len() as i64 {
+            return Err(RepositoryError::NotFound);
+        }
+
+        Ok(entities.to_vec())
     }
 
     async fn save_many(&self, entities: &[T]) -> Result<Vec<T>> {
-        let mut saved = Vec::with_capacity(entities.len());
-        for entity in entities {
-            saved.push(self.save(entity).await?);
+        if entities.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(saved)
+
+        let models = self.replace_models(entities, true)?;
+        self.database
+            .client()
+            .bulk_write(models)
+            .await
+            .map_err(map_error)?;
+
+        Ok(entities.to_vec())
     }
 
     async fn delete_many(&self, ids: &[T::Id]) -> Result<u64> {
@@ -232,6 +259,31 @@ where
             .await
             .map_err(map_error)?;
         Ok(result.deleted_count)
+    }
+}
+
+impl<T: MongoEntity> MongoRepository<T>
+where
+    T::Id: MongoId,
+{
+    fn replace_models(
+        &self,
+        entities: &[T],
+        upsert: bool,
+    ) -> Result<Vec<mongodb::options::ReplaceOneModel>> {
+        let collection = self.collection();
+        entities
+            .iter()
+            .map(|entity| {
+                let filter = id_filter::<T>(entity.id())?;
+                let document = entity.to_document()?;
+                let mut model = collection
+                    .replace_one_model(filter, &document)
+                    .map_err(map_error)?;
+                model.upsert = Some(upsert);
+                Ok(model)
+            })
+            .collect()
     }
 }
 

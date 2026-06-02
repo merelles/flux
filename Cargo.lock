@@ -472,8 +472,15 @@ dependencies = [
 name = "flux-derive"
 version = "0.1.0"
 dependencies = [
+ "flux",
+ "flux-mongodb",
+ "flux-postgres",
+ "mongodb",
+ "proc-macro2",
  "quote",
  "syn",
+ "tokio-postgres",
+ "uuid",
 ]
 
 [[package]]

@@ -12,6 +12,15 @@ repository.workspace = true
 proc-macro = true
 
 [dependencies]
+proc-macro2 = "1"
 syn = { version = "2", features = ["full"] }
 quote = "1"
+
+[dev-dependencies]
+flux = { path = "../flux" }
+flux-mongodb = { path = "../flux-mongodb" }
+flux-postgres = { path = "../flux-postgres" }
+mongodb = "3"
+tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 

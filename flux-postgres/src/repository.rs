@@ -1,13 +1,17 @@
-use std::{any::Any, marker::PhantomData, sync::Arc};
+use std::{any::Any, collections::HashSet, marker::PhantomData, sync::Arc};
 
 use async_trait::async_trait;
 use flux::{
-    BulkRepository, EntityId, GenericFilter, Page, PageRequest, ReadRepository, RelationRepository,
+    AggregateRepository, BulkRepository, CascadeAction, EntityId, GenericFilter, GraphSaveMode,
+    Include, Page, PageRequest, ReadRepository, RelationMetadata, RelationRepository,
     RepositoryError, Result, WriteRepository,
 };
 use tokio_postgres::{types::ToSql, Client};
 
-use crate::{filter::quote_path, render_filter, SqlEntity};
+use crate::{filter::quote_path, render_filter, PostgresAggregate, SqlEntity};
+
+const DEFAULT_RELATION_PAGE_LIMIT: u32 = 512;
+const POSTGRES_MAX_BIND_PARAMS: usize = 60_000;
 
 pub struct PostgresRepository<T: SqlEntity> {
     client: Arc<Client>,
@@ -33,6 +37,337 @@ impl<T: SqlEntity> PostgresRepository<T> {
 
     pub fn client(&self) -> &Arc<Client> {
         &self.client
+    }
+
+    pub async fn load_has_many<C, K>(
+        &self,
+        metadata: &RelationMetadata,
+        source: &K,
+    ) -> Result<Vec<C>>
+    where
+        C: SqlEntity,
+        K: EntityId,
+    {
+        let foreign_key = metadata.foreign_key.ok_or_else(|| {
+            RepositoryError::InvalidData(format!(
+                "relation {} is missing foreign_key",
+                metadata.name
+            ))
+        })?;
+        let child_repo = PostgresRepository::<C>::new(Arc::clone(&self.client));
+        load_all_by_foreign_key(&child_repo, foreign_key, source).await
+    }
+
+    pub async fn load_has_one<C, K>(
+        &self,
+        metadata: &RelationMetadata,
+        source: &K,
+    ) -> Result<Option<C>>
+    where
+        C: SqlEntity,
+        K: EntityId,
+    {
+        let foreign_key = metadata.foreign_key.ok_or_else(|| {
+            RepositoryError::InvalidData(format!(
+                "relation {} is missing foreign_key",
+                metadata.name
+            ))
+        })?;
+        let child_repo = PostgresRepository::<C>::new(Arc::clone(&self.client));
+        let page = child_repo
+            .find_by_foreign_key(
+                foreign_key,
+                source,
+                PageRequest::cursor(1, Option::<C::Id>::None),
+            )
+            .await?;
+        Ok(page.items.into_iter().next())
+    }
+
+    pub async fn save_has_many<C, K>(
+        &self,
+        metadata: &RelationMetadata,
+        children: &[C],
+        source: &K,
+        mode: GraphSaveMode,
+    ) -> Result<()>
+    where
+        C: SqlEntity,
+        K: EntityId,
+    {
+        let foreign_key = metadata.foreign_key.ok_or_else(|| {
+            RepositoryError::InvalidData(format!(
+                "relation {} is missing foreign_key",
+                metadata.name
+            ))
+        })?;
+        let child_repo = PostgresRepository::<C>::new(Arc::clone(&self.client));
+
+        match mode {
+            GraphSaveMode::AppendChildren => {
+                child_repo.insert_many(children).await?;
+            }
+            GraphSaveMode::UpsertChildren => {
+                child_repo.save_many(children).await?;
+            }
+            GraphSaveMode::ReplaceChildren => {
+                let existing = load_all_by_foreign_key(&child_repo, foreign_key, source).await?;
+                let current_ids = children
+                    .iter()
+                    .map(|child| child.id().clone())
+                    .collect::<HashSet<_>>();
+                let delete_ids = existing
+                    .iter()
+                    .filter(|child| !current_ids.contains(child.id()))
+                    .map(|child| child.id().clone())
+                    .collect::<Vec<_>>();
+
+                child_repo.delete_many(&delete_ids).await?;
+                child_repo.save_many(children).await?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn save_has_one<C, K>(
+        &self,
+        metadata: &RelationMetadata,
+        child: Option<&C>,
+        source: &K,
+        mode: GraphSaveMode,
+    ) -> Result<()>
+    where
+        C: SqlEntity,
+        K: EntityId,
+    {
+        let foreign_key = metadata.foreign_key.ok_or_else(|| {
+            RepositoryError::InvalidData(format!(
+                "relation {} is missing foreign_key",
+                metadata.name
+            ))
+        })?;
+        let child_repo = PostgresRepository::<C>::new(Arc::clone(&self.client));
+
+        match (mode, child) {
+            (GraphSaveMode::AppendChildren, Some(child)) => {
+                child_repo.insert(child).await?;
+            }
+            (GraphSaveMode::UpsertChildren | GraphSaveMode::ReplaceChildren, Some(child)) => {
+                child_repo.save(child).await?;
+            }
+            (GraphSaveMode::ReplaceChildren, None) => {
+                child_repo
+                    .delete_by_foreign_key(foreign_key, source)
+                    .await?;
+            }
+            _ => {}
+        }
+
+        Ok(())
+    }
+
+    pub async fn delete_relation<C, K>(&self, metadata: &RelationMetadata, source: &K) -> Result<()>
+    where
+        C: SqlEntity,
+        K: EntityId,
+    {
+        if metadata.cascade != CascadeAction::Delete {
+            return Ok(());
+        }
+
+        let foreign_key = metadata.foreign_key.ok_or_else(|| {
+            RepositoryError::InvalidData(format!(
+                "relation {} is missing foreign_key",
+                metadata.name
+            ))
+        })?;
+        let child_repo = PostgresRepository::<C>::new(Arc::clone(&self.client));
+        child_repo
+            .delete_by_foreign_key(foreign_key, source)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn load_many_to_many<C, K>(
+        &self,
+        metadata: &RelationMetadata,
+        source: &K,
+    ) -> Result<Vec<C>>
+    where
+        C: SqlEntity,
+        K: EntityId,
+    {
+        let join_table = required_relation_part(metadata, metadata.join_table, "join_table")?;
+        let source_key = required_relation_part(metadata, metadata.source_key, "source_key")?;
+        let target_key = required_relation_part(metadata, metadata.target_key, "target_key")?;
+        let target_primary_key = metadata.target_primary_key.unwrap_or_else(C::primary_key);
+
+        let target_table = quote_path(C::table_name())?;
+        let join_table = quote_path(join_table)?;
+        let source_key = quote_path(source_key)?;
+        let target_key = quote_path(target_key)?;
+        let target_primary_key = quote_path(target_primary_key)?;
+        let query = format!(
+            "SELECT target.* FROM {target_table} AS target INNER JOIN {join_table} AS join_table ON target.{target_primary_key} = join_table.{target_key} WHERE join_table.{source_key} = $1 ORDER BY target.{target_primary_key} ASC"
+        );
+        let mut params = Vec::new();
+        push_entity_id_param(&mut params, source)?;
+        let rows = self
+            .client
+            .query(&query, owned_refs(&params).as_slice())
+            .await
+            .map_err(map_error)?;
+        rows.into_iter().map(C::from_row).collect()
+    }
+
+    pub async fn save_many_to_many<C, K>(
+        &self,
+        metadata: &RelationMetadata,
+        children: &[C],
+        source: &K,
+        mode: GraphSaveMode,
+    ) -> Result<()>
+    where
+        C: SqlEntity,
+        K: EntityId,
+    {
+        let child_repo = PostgresRepository::<C>::new(Arc::clone(&self.client));
+        child_repo.save_many(children).await?;
+
+        if mode == GraphSaveMode::ReplaceChildren {
+            self.delete_missing_many_to_many_links(metadata, children, source)
+                .await?;
+        }
+
+        self.insert_many_to_many_links(metadata, children, source)
+            .await
+    }
+
+    pub async fn delete_many_to_many_links<K>(
+        &self,
+        metadata: &RelationMetadata,
+        source: &K,
+    ) -> Result<()>
+    where
+        K: EntityId,
+    {
+        let join_table = quote_path(required_relation_part(
+            metadata,
+            metadata.join_table,
+            "join_table",
+        )?)?;
+        let source_key = quote_path(required_relation_part(
+            metadata,
+            metadata.source_key,
+            "source_key",
+        )?)?;
+        let query = format!("DELETE FROM {join_table} WHERE {source_key} = $1");
+        let mut params = Vec::new();
+        push_entity_id_param(&mut params, source)?;
+        self.client
+            .execute(&query, owned_refs(&params).as_slice())
+            .await
+            .map_err(map_error)?;
+        Ok(())
+    }
+
+    async fn delete_missing_many_to_many_links<C, K>(
+        &self,
+        metadata: &RelationMetadata,
+        children: &[C],
+        source: &K,
+    ) -> Result<()>
+    where
+        C: SqlEntity,
+        K: EntityId,
+    {
+        let join_table = quote_path(required_relation_part(
+            metadata,
+            metadata.join_table,
+            "join_table",
+        )?)?;
+        let source_key = quote_path(required_relation_part(
+            metadata,
+            metadata.source_key,
+            "source_key",
+        )?)?;
+        let target_key = quote_path(required_relation_part(
+            metadata,
+            metadata.target_key,
+            "target_key",
+        )?)?;
+
+        let mut params = Vec::new();
+        push_entity_id_param(&mut params, source)?;
+
+        let query = if children.is_empty() {
+            format!("DELETE FROM {join_table} WHERE {source_key} = $1")
+        } else {
+            for child in children {
+                push_entity_id_param(&mut params, child.id())?;
+            }
+            let placeholders = (2..=params.len())
+                .map(|index| format!("${index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "DELETE FROM {join_table} WHERE {source_key} = $1 AND {target_key} NOT IN ({placeholders})"
+            )
+        };
+
+        self.client
+            .execute(&query, owned_refs(&params).as_slice())
+            .await
+            .map_err(map_error)?;
+        Ok(())
+    }
+
+    async fn insert_many_to_many_links<C, K>(
+        &self,
+        metadata: &RelationMetadata,
+        children: &[C],
+        source: &K,
+    ) -> Result<()>
+    where
+        C: SqlEntity,
+        K: EntityId,
+    {
+        if children.is_empty() {
+            return Ok(());
+        }
+
+        let join_table = quote_path(required_relation_part(
+            metadata,
+            metadata.join_table,
+            "join_table",
+        )?)?;
+        let source_key = quote_path(required_relation_part(
+            metadata,
+            metadata.source_key,
+            "source_key",
+        )?)?;
+        let target_key = quote_path(required_relation_part(
+            metadata,
+            metadata.target_key,
+            "target_key",
+        )?)?;
+
+        let values = values_clause(2, children.len(), 1);
+        let query = format!(
+            "INSERT INTO {join_table} ({source_key}, {target_key}) VALUES {values} ON CONFLICT DO NOTHING"
+        );
+        let mut params = Vec::with_capacity(children.len() * 2);
+        for child in children {
+            push_entity_id_param(&mut params, source)?;
+            push_entity_id_param(&mut params, child.id())?;
+        }
+
+        self.client
+            .execute(&query, owned_refs(&params).as_slice())
+            .await
+            .map_err(map_error)?;
+        Ok(())
     }
 
     async fn query_page(
@@ -99,6 +434,32 @@ impl<T: SqlEntity> PostgresRepository<T> {
         }
     }
 
+    async fn begin_transaction(&self) -> Result<()> {
+        self.client.batch_execute("BEGIN").await.map_err(map_error)
+    }
+
+    async fn commit_transaction(&self) -> Result<()> {
+        self.client.batch_execute("COMMIT").await.map_err(map_error)
+    }
+
+    async fn rollback_transaction(&self) -> Result<()> {
+        self.client
+            .batch_execute("ROLLBACK")
+            .await
+            .map_err(map_error)
+    }
+
+    async fn reload_all_relations(&self, id: &T::Id) -> Result<T>
+    where
+        T: PostgresAggregate,
+    {
+        let includes = T::relations()
+            .iter()
+            .map(|relation| Include::new(relation.name))
+            .collect::<Vec<_>>();
+        self.find_graph_by_id(id, &includes).await
+    }
+
     async fn query_owned(
         &self,
         query: &str,
@@ -141,12 +502,20 @@ where
         self.query_page(None, page).await
     }
 
-    async fn find_all_with_filter(
+    async fn find_page_with_filter(
         &self,
         filter: GenericFilter<T>,
         page: PageRequest<T::Id>,
     ) -> Result<Page<T, T::Id>> {
         self.query_page(Some(filter), page).await
+    }
+
+    async fn find_all_with_filter(
+        &self,
+        filter: GenericFilter<T>,
+        page: PageRequest<T::Id>,
+    ) -> Result<Page<T, T::Id>> {
+        self.find_page_with_filter(filter, page).await
     }
 
     async fn exists(&self, id: &T::Id) -> Result<bool> {
@@ -258,16 +627,26 @@ where
         let table = quote_path(T::table_name())?;
         let fields = T::fields();
         let field_list = quoted_fields(fields)?;
-        let values_clause = values_clause(fields.len(), entities.len(), 1);
-        let query =
-            format!("INSERT INTO {table} ({field_list}) VALUES {values_clause} RETURNING *");
-        let params = collect_insert_params::<T>(entities)?;
-        let rows = self
-            .client
-            .query(&query, params.as_slice())
-            .await
-            .map_err(map_error)?;
-        rows.into_iter().map(T::from_row).collect()
+        let mut saved = Vec::with_capacity(entities.len());
+
+        for chunk in entities.chunks(chunk_size(fields.len())) {
+            let values_clause = values_clause(fields.len(), chunk.len(), 1);
+            let query =
+                format!("INSERT INTO {table} ({field_list}) VALUES {values_clause} RETURNING *");
+            let params = collect_insert_params::<T>(chunk)?;
+            let rows = self
+                .client
+                .query(&query, params.as_slice())
+                .await
+                .map_err(map_error)?;
+            saved.extend(
+                rows.into_iter()
+                    .map(T::from_row)
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+
+        Ok(saved)
     }
 
     async fn update_many(&self, entities: &[T]) -> Result<Vec<T>> {
@@ -279,7 +658,6 @@ where
         let primary_key = quote_path(T::primary_key())?;
         let fields = T::fields();
         let update_fields = update_fields::<T>()?;
-        let values_clause = values_clause(fields.len(), entities.len(), 1);
         let source_columns = quoted_fields(fields)?;
         let set_clause = update_fields
             .iter()
@@ -291,16 +669,27 @@ where
             })
             .collect::<Result<Vec<_>>>()?
             .join(", ");
-        let query = format!(
-            "UPDATE {table} AS target SET {set_clause} FROM (VALUES {values_clause}) AS source ({source_columns}) WHERE target.{primary_key} = source.{primary_key} RETURNING target.*"
-        );
-        let params = collect_insert_params::<T>(entities)?;
-        let rows = self
-            .client
-            .query(&query, params.as_slice())
-            .await
-            .map_err(map_error)?;
-        rows.into_iter().map(T::from_row).collect()
+        let mut saved = Vec::with_capacity(entities.len());
+
+        for chunk in entities.chunks(chunk_size(fields.len())) {
+            let values_clause = values_clause(fields.len(), chunk.len(), 1);
+            let query = format!(
+                "UPDATE {table} AS target SET {set_clause} FROM (VALUES {values_clause}) AS source ({source_columns}) WHERE target.{primary_key} = source.{primary_key} RETURNING target.*"
+            );
+            let params = collect_insert_params::<T>(chunk)?;
+            let rows = self
+                .client
+                .query(&query, params.as_slice())
+                .await
+                .map_err(map_error)?;
+            saved.extend(
+                rows.into_iter()
+                    .map(T::from_row)
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+
+        Ok(saved)
     }
 
     async fn save_many(&self, entities: &[T]) -> Result<Vec<T>> {
@@ -312,7 +701,6 @@ where
         let primary_key = quote_path(T::primary_key())?;
         let fields = T::fields();
         let field_list = quoted_fields(fields)?;
-        let values_clause = values_clause(fields.len(), entities.len(), 1);
         let update_fields = update_fields::<T>()?;
         let update_clause = update_fields
             .iter()
@@ -324,16 +712,27 @@ where
             })
             .collect::<Result<Vec<_>>>()?
             .join(", ");
-        let query = format!(
-            "INSERT INTO {table} ({field_list}) VALUES {values_clause} ON CONFLICT ({primary_key}) DO UPDATE SET {update_clause} RETURNING *"
-        );
-        let params = collect_insert_params::<T>(entities)?;
-        let rows = self
-            .client
-            .query(&query, params.as_slice())
-            .await
-            .map_err(map_error)?;
-        rows.into_iter().map(T::from_row).collect()
+        let mut saved = Vec::with_capacity(entities.len());
+
+        for chunk in entities.chunks(chunk_size(fields.len())) {
+            let values_clause = values_clause(fields.len(), chunk.len(), 1);
+            let query = format!(
+                "INSERT INTO {table} ({field_list}) VALUES {values_clause} ON CONFLICT ({primary_key}) DO UPDATE SET {update_clause} RETURNING *"
+            );
+            let params = collect_insert_params::<T>(chunk)?;
+            let rows = self
+                .client
+                .query(&query, params.as_slice())
+                .await
+                .map_err(map_error)?;
+            saved.extend(
+                rows.into_iter()
+                    .map(T::from_row)
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+
+        Ok(saved)
     }
 
     async fn delete_many(&self, ids: &[T::Id]) -> Result<u64> {
@@ -343,19 +742,26 @@ where
 
         let table = quote_path(T::table_name())?;
         let primary_key = quote_path(T::primary_key())?;
-        let placeholders = (1..=ids.len())
-            .map(|index| format!("${index}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let query = format!("DELETE FROM {table} WHERE {primary_key} IN ({placeholders})");
-        let mut params = Vec::new();
-        for id in ids {
-            push_entity_id_param(&mut params, id)?;
+        let mut affected = 0;
+
+        for chunk in ids.chunks(POSTGRES_MAX_BIND_PARAMS) {
+            let placeholders = (1..=chunk.len())
+                .map(|index| format!("${index}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!("DELETE FROM {table} WHERE {primary_key} IN ({placeholders})");
+            let mut params = Vec::new();
+            for id in chunk {
+                push_entity_id_param(&mut params, id)?;
+            }
+            affected += self
+                .client
+                .execute(&query, owned_refs(&params).as_slice())
+                .await
+                .map_err(map_error)?;
         }
-        self.client
-            .execute(&query, owned_refs(&params).as_slice())
-            .await
-            .map_err(map_error)
+
+        Ok(affected)
     }
 }
 
@@ -374,7 +780,7 @@ where
         K: EntityId,
     {
         let filter = GenericFilter::<T>::new().eq(field, entity_id_to_filter_value(value)?);
-        self.find_all_with_filter(filter, page).await
+        self.find_page_with_filter(filter, page).await
     }
 
     async fn delete_by_foreign_key<K>(&self, field: &str, value: &K) -> Result<u64>
@@ -390,6 +796,98 @@ where
             .execute(&query, owned_refs(&params).as_slice())
             .await
             .map_err(map_error)
+    }
+}
+
+#[async_trait]
+impl<A> AggregateRepository<A> for PostgresRepository<A>
+where
+    A: PostgresAggregate,
+{
+    async fn find_graph_by_id(&self, id: &A::Id, includes: &[Include<A>]) -> Result<A> {
+        let mut aggregate = self.find_by_id(id).await?;
+        A::load_relations(self, &mut aggregate, includes).await?;
+        Ok(aggregate)
+    }
+
+    async fn insert_graph(&self, aggregate: &A) -> Result<A> {
+        self.begin_transaction().await?;
+
+        let saved = match self.insert(aggregate).await {
+            Ok(saved) => saved,
+            Err(error) => {
+                self.rollback_transaction().await?;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = A::insert_relations(self, aggregate).await {
+            self.rollback_transaction().await?;
+            return Err(error);
+        }
+
+        self.commit_transaction().await?;
+        self.reload_all_relations(saved.id()).await
+    }
+
+    async fn update_graph(&self, aggregate: &A, mode: GraphSaveMode) -> Result<A> {
+        self.begin_transaction().await?;
+
+        let saved = match self.update(aggregate).await {
+            Ok(saved) => saved,
+            Err(error) => {
+                self.rollback_transaction().await?;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = A::update_relations(self, aggregate, mode).await {
+            self.rollback_transaction().await?;
+            return Err(error);
+        }
+
+        self.commit_transaction().await?;
+        self.reload_all_relations(saved.id()).await
+    }
+
+    async fn save_graph(&self, aggregate: &A, mode: GraphSaveMode) -> Result<A> {
+        self.begin_transaction().await?;
+
+        let saved = match self.save(aggregate).await {
+            Ok(saved) => saved,
+            Err(error) => {
+                self.rollback_transaction().await?;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = A::update_relations(self, aggregate, mode).await {
+            self.rollback_transaction().await?;
+            return Err(error);
+        }
+
+        self.commit_transaction().await?;
+        self.reload_all_relations(saved.id()).await
+    }
+
+    async fn delete_graph(&self, id: &A::Id) -> Result<bool> {
+        self.begin_transaction().await?;
+
+        if let Err(error) = A::delete_relations(self, id).await {
+            self.rollback_transaction().await?;
+            return Err(error);
+        }
+
+        let deleted = match self.delete(id).await {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                self.rollback_transaction().await?;
+                return Err(error);
+            }
+        };
+
+        self.commit_transaction().await?;
+        Ok(deleted)
     }
 }
 
@@ -409,6 +907,48 @@ fn build_select_query(
         .map(|placeholder| format!(" OFFSET {placeholder}"))
         .unwrap_or_default();
     format!("SELECT * FROM {table}{where_clause} ORDER BY {order_by} LIMIT {limit_placeholder}{offset_clause}")
+}
+
+async fn load_all_by_foreign_key<C, K>(
+    repository: &PostgresRepository<C>,
+    field: &str,
+    value: &K,
+) -> Result<Vec<C>>
+where
+    C: SqlEntity,
+    K: EntityId,
+{
+    let mut items = Vec::new();
+    let mut after = None;
+
+    loop {
+        let page = repository
+            .find_by_foreign_key(
+                field,
+                value,
+                PageRequest::cursor(DEFAULT_RELATION_PAGE_LIMIT, after),
+            )
+            .await?;
+        let next_cursor = page.next_cursor;
+        items.extend(page.items);
+
+        if next_cursor.is_none() {
+            break;
+        }
+        after = next_cursor;
+    }
+
+    Ok(items)
+}
+
+fn required_relation_part<'a>(
+    metadata: &RelationMetadata,
+    value: Option<&'a str>,
+    name: &str,
+) -> Result<&'a str> {
+    value.ok_or_else(|| {
+        RepositoryError::InvalidData(format!("relation {} is missing {name}", metadata.name))
+    })
 }
 
 fn page_from_rows<T: SqlEntity>(
@@ -441,6 +981,11 @@ fn collect_insert_params<T: SqlEntity>(entities: &[T]) -> Result<Vec<&(dyn ToSql
         params.extend(entity_params);
     }
     Ok(params)
+}
+
+fn chunk_size(field_count: usize) -> usize {
+    let field_count = field_count.max(1);
+    (POSTGRES_MAX_BIND_PARAMS / field_count).max(1)
 }
 
 fn values_clause(field_count: usize, entity_count: usize, start_index: usize) -> String {

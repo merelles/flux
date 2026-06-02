@@ -8,6 +8,12 @@ pub trait ReadRepository<T: Entity>: Send + Sync {
 
     async fn find_page(&self, page: PageRequest<T::Id>) -> Result<Page<T, T::Id>>;
 
+    async fn find_page_with_filter(
+        &self,
+        filter: GenericFilter<T>,
+        page: PageRequest<T::Id>,
+    ) -> Result<Page<T, T::Id>>;
+
     async fn find_all_with_filter(
         &self,
         filter: GenericFilter<T>,
