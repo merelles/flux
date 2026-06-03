@@ -660,7 +660,6 @@ Important rules:
 More detail:
 
 - [Usage guide](docs/usage.md)
-- [Architecture review](docs/architecture-review.md)
 
 ## License
 
