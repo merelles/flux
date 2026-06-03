@@ -10,7 +10,10 @@ repository.workspace = true
 
 [dependencies]
 async-trait = "0.1.87"
+deadpool-postgres = "0.14"
 flux = { path = "../flux" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rust_decimal = "1"
 tokio = { version = "1", features = ["sync"] }
-tokio-postgres = { version = "0.7", features = ["with-uuid-1"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
 uuid = { version = "1", features = ["v4", "serde"] }

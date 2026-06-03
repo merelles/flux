@@ -52,6 +52,18 @@ impl<T: MongoEntity> MongoRepository<T> {
         }
     }
 
+    fn child_repository<C>(&self) -> MongoRepository<C>
+    where
+        C: MongoEntity,
+    {
+        match &self.session {
+            Some(session) => {
+                MongoRepository::<C>::with_session(self.database.clone(), Arc::clone(session))
+            }
+            None => MongoRepository::<C>::new(self.database.clone()),
+        }
+    }
+
     pub fn collection(&self) -> Collection<Document> {
         self.database.collection::<Document>(T::collection_name())
     }
@@ -120,21 +132,21 @@ impl<T: MongoEntity> MongoRepository<T> {
         session.abort_transaction().await.map_err(map_error)
     }
 
-    async fn insert_one_document(&self, document: Document) -> Result<()> {
-        if let Some(session) = &self.session {
+    async fn insert_one_document(&self, document: Document) -> Result<Bson> {
+        let result = if let Some(session) = &self.session {
             let mut session = session.lock().await;
             self.collection()
                 .insert_one(document)
                 .session(&mut *session)
                 .await
-                .map_err(map_error)?;
+                .map_err(map_error)?
         } else {
             self.collection()
                 .insert_one(document)
                 .await
-                .map_err(map_error)?;
-        }
-        Ok(())
+                .map_err(map_error)?
+        };
+        Ok(result.inserted_id)
     }
 
     async fn insert_many_documents(&self, documents: Vec<Document>) -> Result<()> {
@@ -265,7 +277,7 @@ impl<T: MongoEntity> MongoRepository<T> {
         K: EntityId,
     {
         let foreign_key = required_relation_part(metadata, metadata.foreign_key, "foreign_key")?;
-        let child_repo = MongoRepository::<C>::new(self.database.clone());
+        let child_repo = self.child_repository::<C>();
         load_all_by_foreign_key(&child_repo, foreign_key, source).await
     }
 
@@ -280,7 +292,7 @@ impl<T: MongoEntity> MongoRepository<T> {
         K: EntityId,
     {
         let foreign_key = required_relation_part(metadata, metadata.foreign_key, "foreign_key")?;
-        let child_repo = MongoRepository::<C>::new(self.database.clone());
+        let child_repo = self.child_repository::<C>();
         let page = child_repo
             .find_by_foreign_key(
                 foreign_key,
@@ -304,7 +316,7 @@ impl<T: MongoEntity> MongoRepository<T> {
         K: EntityId,
     {
         let foreign_key = required_relation_part(metadata, metadata.foreign_key, "foreign_key")?;
-        let child_repo = MongoRepository::<C>::new(self.database.clone());
+        let child_repo = self.child_repository::<C>();
 
         match mode {
             GraphSaveMode::AppendChildren => {
@@ -345,7 +357,7 @@ impl<T: MongoEntity> MongoRepository<T> {
         K: EntityId,
     {
         let foreign_key = required_relation_part(metadata, metadata.foreign_key, "foreign_key")?;
-        let child_repo = MongoRepository::<C>::new(self.database.clone());
+        let child_repo = self.child_repository::<C>();
 
         match (mode, child) {
             (GraphSaveMode::AppendChildren, Some(child)) => {
@@ -382,7 +394,7 @@ impl<T: MongoEntity> MongoRepository<T> {
         }
 
         let foreign_key = required_relation_part(metadata, metadata.foreign_key, "foreign_key")?;
-        let child_repo = MongoRepository::<C>::new(self.database.clone());
+        let child_repo = self.child_repository::<C>();
         child_repo
             .delete_by_foreign_key(foreign_key, source)
             .await?;
@@ -419,7 +431,7 @@ impl<T: MongoEntity> MongoRepository<T> {
             return Ok(Vec::new());
         }
 
-        let child_repo = MongoRepository::<C>::new(self.database.clone());
+        let child_repo = self.child_repository::<C>();
         let mut in_filter = Document::new();
         in_filter.insert("$in", Bson::Array(target_values));
         let mut target_filter = Document::new();
@@ -450,7 +462,7 @@ impl<T: MongoEntity> MongoRepository<T> {
         C::Id: MongoId,
         K: EntityId,
     {
-        let child_repo = MongoRepository::<C>::new(self.database.clone());
+        let child_repo = self.child_repository::<C>();
         child_repo.save_many(children).await?;
 
         if mode == GraphSaveMode::ReplaceChildren && metadata.on_replace != OnReplace::KeepMissing {
@@ -660,8 +672,12 @@ where
     T::Id: MongoId,
 {
     async fn insert(&self, entity: &T) -> Result<T> {
-        self.insert_one_document(entity.to_document()?).await?;
-        Ok(entity.clone())
+        let inserted_id = self.insert_one_document(entity.to_document()?).await?;
+        let mut saved = entity.clone();
+        if !saved.has_id() {
+            <T as flux::Entity>::set_id(&mut saved, bson_to_entity_id::<T::Id>(inserted_id)?);
+        }
+        Ok(saved)
     }
 
     async fn update(&self, entity: &T) -> Result<T> {
@@ -829,7 +845,10 @@ where
                 return Err(error);
             }
         };
-        if let Err(error) = A::insert_relations(&tx_repo, aggregate).await {
+        let mut aggregate = aggregate.clone();
+        <A as flux::Entity>::set_id(&mut aggregate, saved.id().clone());
+
+        if let Err(error) = A::insert_relations(&tx_repo, &aggregate).await {
             tx_repo.rollback_transaction_repository().await?;
             return Err(error);
         }
@@ -1083,6 +1102,27 @@ fn entity_id_to_bson<I: EntityId>(id: &I) -> Result<Bson> {
     } else {
         Err(unsupported_id::<I>())
     }
+}
+
+fn bson_to_entity_id<I: EntityId>(value: Bson) -> Result<I> {
+    let value: Box<dyn std::any::Any> = match value {
+        Bson::ObjectId(value) => Box::new(crate::MongoObjectId(value)),
+        Bson::String(value) => Box::new(value),
+        Bson::Int32(value) => Box::new(value),
+        Bson::Int64(value) => Box::new(value),
+        other => {
+            return Err(RepositoryError::Unsupported(format!(
+                "unsupported generated Mongo id value: {other:?}"
+            )));
+        }
+    };
+
+    value.downcast::<I>().map(|value| *value).map_err(|_| {
+        RepositoryError::Unsupported(format!(
+            "generated Mongo id cannot be converted to {}",
+            std::any::type_name::<I>()
+        ))
+    })
 }
 
 fn id_filter<T>(id: &T::Id) -> Result<Document>

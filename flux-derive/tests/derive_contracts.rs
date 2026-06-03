@@ -24,6 +24,15 @@ struct Category {
     name: String,
 }
 
+#[derive(Clone, Debug, Entity, SqlEntity)]
+#[table_name = "generated_products"]
+struct GeneratedProduct {
+    #[primary_key]
+    #[generated_id]
+    product_id: i64,
+    name: String,
+}
+
 #[derive(Clone, Debug, Entity, SqlServerEntity)]
 #[table_name = "sqlserver_order_items"]
 struct SqlServerOrderItem {
@@ -290,6 +299,21 @@ fn derives_sqlserver_entity_contract() {
     assert_eq!(category.id(), &10);
     assert_eq!(category.to_insert_params().len(), 2);
     assert_eq!(category.to_update_params().len(), 1);
+}
+
+#[test]
+fn derives_generated_id_contract() {
+    let mut product = GeneratedProduct {
+        product_id: 0,
+        name: "Keyboard".to_string(),
+    };
+
+    assert!(!product.has_id());
+    product.set_id(42);
+    assert!(product.has_id());
+    assert_eq!(product.id(), &42);
+    assert_eq!(GeneratedProduct::fields(), &["product_id", "name"]);
+    assert_eq!(product.to_update_params().len(), 1);
 }
 
 #[test]

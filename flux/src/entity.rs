@@ -10,6 +10,9 @@ pub trait Entity: Send + Sync + Sized + Clone {
 
     /// Allows adapters to distinguish new entities when an ID type supports it.
     fn has_id(&self) -> bool;
+
+    /// Replaces the entity identifier after an adapter returns a generated value.
+    fn set_id(&mut self, _id: Self::Id) {}
 }
 
 /// Identifier types accepted by the core repository contracts.

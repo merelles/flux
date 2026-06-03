@@ -164,6 +164,14 @@ fn push_filter_value(
         FilterValue::F64(value) => params.push(Box::new(*value)),
         FilterValue::String(value) => params.push(Box::new(value.clone())),
         FilterValue::Uuid(value) => params.push(Box::new(*value)),
+        FilterValue::DateTimeUtc(value) => params.push(Box::new(*value)),
+        FilterValue::NaiveDate(value) => params.push(Box::new(*value)),
+        FilterValue::NaiveDateTime(value) => params.push(Box::new(*value)),
+        FilterValue::Decimal(_) => {
+            return Err(RepositoryError::Unsupported(
+                "Decimal filters are not supported by tokio-postgres bindings".to_string(),
+            ));
+        }
         FilterValue::Backend { type_name, .. } => {
             return Err(RepositoryError::Unsupported(format!(
                 "unsupported backend-specific filter value for Postgres: {type_name}"

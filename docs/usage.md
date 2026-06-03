@@ -927,6 +927,21 @@ let order = Order {
 
 Database-generated IDs can be supported later, but they require the aggregate repository to copy the generated parent key into child foreign keys before bulk insert.
 
+Implemented syntax for SQL-generated IDs:
+
+```rust
+#[derive(Clone, Debug, Entity, SqlEntity)]
+#[table_name = "products"]
+pub struct Product {
+    #[primary_key]
+    #[generated_id]
+    pub product_id: i64,
+    pub name: String,
+}
+```
+
+For derived entities, `#[generated_id]` makes `has_id()` compare the primary key against `Default::default()`. Inserts with no ID omit the primary key column and use the row returned by the database to populate the entity ID. Aggregate inserts use the saved root ID when persisting relation fields, and generated relation metadata copies the parent key into `#[has_one]` and `#[has_many]` child foreign keys before saving children.
+
 ## Recommended Implementation Order
 
 1. Split the workspace into `flux`, `flux-derive`, `flux-postgres`, and future adapter crates

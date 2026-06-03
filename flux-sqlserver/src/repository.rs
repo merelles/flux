@@ -685,14 +685,30 @@ where
 
         let table = quote_path(T::table_name())?;
         let fields = T::fields();
-        let field_list = quoted_fields(fields)?;
+        let generated_ids = entities.iter().all(|entity| !entity.has_id());
+        if !generated_ids && entities.iter().any(|entity| !entity.has_id()) {
+            return Err(RepositoryError::InvalidData(
+                "insert_many cannot mix entities with and without ids".to_string(),
+            ));
+        }
+        let insert_fields = if generated_ids {
+            update_fields::<T>()?
+        } else {
+            fields.to_vec()
+        };
+        let field_list = quoted_fields(&insert_fields)?;
+        let field_count = insert_fields.len();
         let mut saved = Vec::with_capacity(entities.len());
 
-        for chunk in entities.chunks(chunk_size(fields.len())) {
-            let values = values_clause(fields.len(), chunk.len(), 1);
+        for chunk in entities.chunks(chunk_size(field_count)) {
+            let values = values_clause(field_count, chunk.len(), 1);
             let query =
                 format!("INSERT INTO {table} ({field_list}) OUTPUT INSERTED.* VALUES {values}");
-            let params = collect_insert_params::<T>(chunk)?;
+            let params = if generated_ids {
+                collect_update_params::<T>(chunk)?
+            } else {
+                collect_insert_params::<T>(chunk)?
+            };
             let rows = self.query_params(&query, params.as_slice()).await?;
             saved.extend(
                 rows.into_iter()
@@ -870,7 +886,10 @@ where
             }
         };
 
-        if let Err(error) = A::insert_relations(self, aggregate).await {
+        let mut aggregate = aggregate.clone();
+        <A as flux::Entity>::set_id(&mut aggregate, saved.id().clone());
+
+        if let Err(error) = A::insert_relations(self, &aggregate).await {
             self.rollback_transaction().await?;
             return Err(error);
         }
@@ -1106,6 +1125,22 @@ fn collect_insert_params<T: SqlServerEntity>(entities: &[T]) -> Result<Vec<&dyn 
         if entity_params.len() != fields_len {
             return Err(RepositoryError::InvalidData(format!(
                 "expected {fields_len} insert params, got {}",
+                entity_params.len()
+            )));
+        }
+        params.extend(entity_params);
+    }
+    Ok(params)
+}
+
+fn collect_update_params<T: SqlServerEntity>(entities: &[T]) -> Result<Vec<&dyn tiberius::ToSql>> {
+    let fields_len = T::fields().len().saturating_sub(1);
+    let mut params = Vec::with_capacity(fields_len * entities.len());
+    for entity in entities {
+        let entity_params = entity.to_update_params();
+        if entity_params.len() != fields_len {
+            return Err(RepositoryError::InvalidData(format!(
+                "expected {fields_len} generated-id insert params, got {}",
                 entity_params.len()
             )));
         }

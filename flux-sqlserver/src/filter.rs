@@ -163,6 +163,10 @@ fn push_filter_value(
         FilterValue::F64(value) => params.push(Box::new(*value)),
         FilterValue::String(value) => params.push(Box::new(value.clone())),
         FilterValue::Uuid(value) => params.push(Box::new(*value)),
+        FilterValue::DateTimeUtc(value) => params.push(Box::new(value.naive_utc())),
+        FilterValue::NaiveDate(value) => params.push(Box::new(*value)),
+        FilterValue::NaiveDateTime(value) => params.push(Box::new(*value)),
+        FilterValue::Decimal(value) => params.push(Box::new(*value)),
         FilterValue::Backend { type_name, .. } => {
             return Err(RepositoryError::Unsupported(format!(
                 "unsupported backend-specific filter value for SQL Server: {type_name}"

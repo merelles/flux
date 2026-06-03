@@ -26,6 +26,10 @@ pub enum FilterValue {
     F64(f64),
     String(String),
     Uuid(Uuid),
+    DateTimeUtc(chrono::DateTime<chrono::Utc>),
+    NaiveDate(chrono::NaiveDate),
+    NaiveDateTime(chrono::NaiveDateTime),
+    Decimal(rust_decimal::Decimal),
     Backend {
         type_name: &'static str,
         value: String,
@@ -56,6 +60,10 @@ impl_filter_value!(
     f64 => F64,
     String => String,
     Uuid => Uuid,
+    chrono::DateTime<chrono::Utc> => DateTimeUtc,
+    chrono::NaiveDate => NaiveDate,
+    chrono::NaiveDateTime => NaiveDateTime,
+    rust_decimal::Decimal => Decimal,
 );
 
 impl From<&str> for FilterValue {

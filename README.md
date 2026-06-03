@@ -21,16 +21,17 @@ Implemented:
 - backend-neutral `GenericFilter` AST
 - Postgres adapter crate
 - MongoDB adapter crate
-- basic aggregate metadata types
+- SQL Server adapter crate
+- `SqlEntity`, `MongoEntity`, `SqlServerEntity`, and `AggregateRoot` derive macros
+- aggregate graph persistence for Postgres, MongoDB, and SQL Server
+- many-to-many graph persistence
+- generated SQL IDs with `#[generated_id]`
 
 In progress / next steps:
 
-- `SqlEntity` derive macro
-- `MongoEntity` derive macro
-- `AggregateRoot` derive macro
-- `AggregateRepository` implementations
-- Mongo bulk upsert using native bulk write operations
-- many-to-many graph persistence
+- broader generated-ID ergonomics for non-SQL backends
+- richer backend-specific field types
+- integration tests against live database instances
 
 ## Workspace
 
@@ -572,7 +573,7 @@ let saved = repo.insert_many(&customers).await?;
 
 ## Aggregate Syntax
 
-The core crate has metadata types for aggregates, but graph persistence is still a next step for adapter crates.
+The core crate has metadata types for aggregates, and adapter crates implement graph persistence for derived aggregate roots.
 
 Target syntax:
 
@@ -616,7 +617,7 @@ delete missing items if requested
 commit
 ```
 
-Until `AggregateRepository` is implemented in adapters, use explicit repositories:
+For cases that should remain explicit, use row repositories directly:
 
 ```rust
 let saved_order = order_repo.insert(&order).await?;

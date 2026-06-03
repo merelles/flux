@@ -14,8 +14,33 @@ use crate::{filter::quote_path, render_filter, PostgresAggregate, SqlEntity};
 const DEFAULT_RELATION_PAGE_LIMIT: u32 = 512;
 const POSTGRES_MAX_BIND_PARAMS: usize = 60_000;
 
+#[derive(Clone)]
+pub enum PostgresConnection {
+    Client(Arc<Client>),
+    Pool(deadpool_postgres::Pool),
+    PooledClient(Arc<Mutex<deadpool_postgres::Object>>),
+}
+
+impl From<Arc<Client>> for PostgresConnection {
+    fn from(client: Arc<Client>) -> Self {
+        Self::Client(client)
+    }
+}
+
+impl From<Client> for PostgresConnection {
+    fn from(client: Client) -> Self {
+        Self::Client(Arc::new(client))
+    }
+}
+
+impl From<deadpool_postgres::Pool> for PostgresConnection {
+    fn from(pool: deadpool_postgres::Pool) -> Self {
+        Self::Pool(pool)
+    }
+}
+
 pub struct PostgresRepository<T: SqlEntity> {
-    client: Arc<Client>,
+    connection: PostgresConnection,
     transaction_lock: Arc<Mutex<()>>,
     _marker: PhantomData<T>,
 }
@@ -23,7 +48,7 @@ pub struct PostgresRepository<T: SqlEntity> {
 impl<T: SqlEntity> Clone for PostgresRepository<T> {
     fn clone(&self) -> Self {
         Self {
-            client: Arc::clone(&self.client),
+            connection: self.connection.clone(),
             transaction_lock: Arc::clone(&self.transaction_lock),
             _marker: PhantomData,
         }
@@ -31,24 +56,37 @@ impl<T: SqlEntity> Clone for PostgresRepository<T> {
 }
 
 impl<T: SqlEntity> PostgresRepository<T> {
-    pub fn new(client: Arc<Client>) -> Self {
+    pub fn new<C>(connection: C) -> Self
+    where
+        C: Into<PostgresConnection>,
+    {
         Self {
-            client,
+            connection: connection.into(),
             transaction_lock: Arc::new(Mutex::new(())),
             _marker: PhantomData,
         }
     }
 
-    fn with_shared_state(client: Arc<Client>, transaction_lock: Arc<Mutex<()>>) -> Self {
+    fn with_shared_state(connection: PostgresConnection, transaction_lock: Arc<Mutex<()>>) -> Self {
         Self {
-            client,
+            connection,
             transaction_lock,
             _marker: PhantomData,
         }
     }
 
-    pub fn client(&self) -> &Arc<Client> {
-        &self.client
+    pub fn client(&self) -> Option<&Arc<Client>> {
+        match &self.connection {
+            PostgresConnection::Client(client) => Some(client),
+            PostgresConnection::Pool(_) | PostgresConnection::PooledClient(_) => None,
+        }
+    }
+
+    pub fn pool(&self) -> Option<&deadpool_postgres::Pool> {
+        match &self.connection {
+            PostgresConnection::Pool(pool) => Some(pool),
+            PostgresConnection::Client(_) | PostgresConnection::PooledClient(_) => None,
+        }
     }
 
     pub async fn load_has_many<C, K>(
@@ -67,7 +105,7 @@ impl<T: SqlEntity> PostgresRepository<T> {
             ))
         })?;
         let child_repo = PostgresRepository::<C>::with_shared_state(
-            Arc::clone(&self.client),
+            self.connection.clone(),
             Arc::clone(&self.transaction_lock),
         );
         load_all_by_foreign_key(&child_repo, foreign_key, source).await
@@ -89,7 +127,7 @@ impl<T: SqlEntity> PostgresRepository<T> {
             ))
         })?;
         let child_repo = PostgresRepository::<C>::with_shared_state(
-            Arc::clone(&self.client),
+            self.connection.clone(),
             Arc::clone(&self.transaction_lock),
         );
         let page = child_repo
@@ -120,7 +158,7 @@ impl<T: SqlEntity> PostgresRepository<T> {
             ))
         })?;
         let child_repo = PostgresRepository::<C>::with_shared_state(
-            Arc::clone(&self.client),
+            self.connection.clone(),
             Arc::clone(&self.transaction_lock),
         );
 
@@ -169,7 +207,7 @@ impl<T: SqlEntity> PostgresRepository<T> {
             ))
         })?;
         let child_repo = PostgresRepository::<C>::with_shared_state(
-            Arc::clone(&self.client),
+            self.connection.clone(),
             Arc::clone(&self.transaction_lock),
         );
 
@@ -213,7 +251,7 @@ impl<T: SqlEntity> PostgresRepository<T> {
             ))
         })?;
         let child_repo = PostgresRepository::<C>::with_shared_state(
-            Arc::clone(&self.client),
+            self.connection.clone(),
             Arc::clone(&self.transaction_lock),
         );
         child_repo
@@ -246,11 +284,7 @@ impl<T: SqlEntity> PostgresRepository<T> {
         );
         let mut params = Vec::new();
         push_entity_id_param(&mut params, source)?;
-        let rows = self
-            .client
-            .query(&query, owned_refs(&params).as_slice())
-            .await
-            .map_err(map_error)?;
+        let rows = self.query_owned(&query, &params).await?;
         rows.into_iter().map(C::from_row).collect()
     }
 
@@ -266,7 +300,7 @@ impl<T: SqlEntity> PostgresRepository<T> {
         K: EntityId,
     {
         let child_repo = PostgresRepository::<C>::with_shared_state(
-            Arc::clone(&self.client),
+            self.connection.clone(),
             Arc::clone(&self.transaction_lock),
         );
         child_repo.save_many(children).await?;
@@ -303,10 +337,7 @@ impl<T: SqlEntity> PostgresRepository<T> {
         let query = format!("DELETE FROM {join_table} WHERE {source_key} = $1");
         let mut params = Vec::new();
         push_entity_id_param(&mut params, source)?;
-        self.client
-            .execute(&query, owned_refs(&params).as_slice())
-            .await
-            .map_err(map_error)?;
+        self.execute_owned(&query, &params).await?;
         Ok(())
     }
 
@@ -354,10 +385,7 @@ impl<T: SqlEntity> PostgresRepository<T> {
             )
         };
 
-        self.client
-            .execute(&query, owned_refs(&params).as_slice())
-            .await
-            .map_err(map_error)?;
+        self.execute_owned(&query, &params).await?;
         Ok(())
     }
 
@@ -401,10 +429,7 @@ impl<T: SqlEntity> PostgresRepository<T> {
             push_entity_id_param(&mut params, child.id())?;
         }
 
-        self.client
-            .execute(&query, owned_refs(&params).as_slice())
-            .await
-            .map_err(map_error)?;
+        self.execute_owned(&query, &params).await?;
         Ok(())
     }
 
@@ -476,18 +501,32 @@ impl<T: SqlEntity> PostgresRepository<T> {
     }
 
     async fn begin_transaction(&self) -> Result<()> {
-        self.client.batch_execute("BEGIN").await.map_err(map_error)
+        self.batch_execute("BEGIN").await
     }
 
     async fn commit_transaction(&self) -> Result<()> {
-        self.client.batch_execute("COMMIT").await.map_err(map_error)
+        self.batch_execute("COMMIT").await
     }
 
     async fn rollback_transaction(&self) -> Result<()> {
-        self.client
-            .batch_execute("ROLLBACK")
-            .await
-            .map_err(map_error)
+        self.batch_execute("ROLLBACK").await
+    }
+
+    async fn transaction_repository(&self) -> Result<Self> {
+        let connection = match &self.connection {
+            PostgresConnection::Client(_) | PostgresConnection::PooledClient(_) => {
+                self.connection.clone()
+            }
+            PostgresConnection::Pool(pool) => {
+                let client = pool.get().await.map_err(map_pool_error)?;
+                PostgresConnection::PooledClient(Arc::new(Mutex::new(client)))
+            }
+        };
+
+        Ok(Self::with_shared_state(
+            connection,
+            Arc::clone(&self.transaction_lock),
+        ))
     }
 
     async fn reload_all_relations(&self, id: &T::Id) -> Result<T>
@@ -510,10 +549,126 @@ impl<T: SqlEntity> PostgresRepository<T> {
             .iter()
             .map(|param| param.as_ref() as &(dyn ToSql + Sync))
             .collect::<Vec<_>>();
-        self.client
-            .query(query, refs.as_slice())
-            .await
-            .map_err(map_error)
+        self.query_params(query, refs.as_slice()).await
+    }
+
+    async fn query_params(
+        &self,
+        query: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Vec<tokio_postgres::Row>> {
+        match &self.connection {
+            PostgresConnection::Client(client) => {
+                client.query(query, params).await.map_err(map_error)
+            }
+            PostgresConnection::Pool(pool) => {
+                let client = pool.get().await.map_err(map_pool_error)?;
+                client.query(query, params).await.map_err(map_error)
+            }
+            PostgresConnection::PooledClient(client) => {
+                let client = client.lock().await;
+                client.query(query, params).await.map_err(map_error)
+            }
+        }
+    }
+
+    async fn query_one_owned(
+        &self,
+        query: &str,
+        params: &[Box<dyn ToSql + Sync + Send>],
+    ) -> Result<tokio_postgres::Row> {
+        let refs = owned_refs(params);
+        self.query_one_params(query, refs.as_slice()).await
+    }
+
+    async fn query_one_params(
+        &self,
+        query: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<tokio_postgres::Row> {
+        match &self.connection {
+            PostgresConnection::Client(client) => {
+                client.query_one(query, params).await.map_err(map_error)
+            }
+            PostgresConnection::Pool(pool) => {
+                let client = pool.get().await.map_err(map_pool_error)?;
+                client.query_one(query, params).await.map_err(map_error)
+            }
+            PostgresConnection::PooledClient(client) => {
+                let client = client.lock().await;
+                client.query_one(query, params).await.map_err(map_error)
+            }
+        }
+    }
+
+    async fn query_opt_owned(
+        &self,
+        query: &str,
+        params: &[Box<dyn ToSql + Sync + Send>],
+    ) -> Result<Option<tokio_postgres::Row>> {
+        let refs = owned_refs(params);
+        self.query_opt_params(query, refs.as_slice()).await
+    }
+
+    async fn query_opt_params(
+        &self,
+        query: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Option<tokio_postgres::Row>> {
+        match &self.connection {
+            PostgresConnection::Client(client) => {
+                client.query_opt(query, params).await.map_err(map_error)
+            }
+            PostgresConnection::Pool(pool) => {
+                let client = pool.get().await.map_err(map_pool_error)?;
+                client.query_opt(query, params).await.map_err(map_error)
+            }
+            PostgresConnection::PooledClient(client) => {
+                let client = client.lock().await;
+                client.query_opt(query, params).await.map_err(map_error)
+            }
+        }
+    }
+
+    async fn execute_owned(
+        &self,
+        query: &str,
+        params: &[Box<dyn ToSql + Sync + Send>],
+    ) -> Result<u64> {
+        let refs = owned_refs(params);
+        self.execute_params(query, refs.as_slice()).await
+    }
+
+    async fn execute_params(&self, query: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64> {
+        match &self.connection {
+            PostgresConnection::Client(client) => {
+                client.execute(query, params).await.map_err(map_error)
+            }
+            PostgresConnection::Pool(pool) => {
+                let client = pool.get().await.map_err(map_pool_error)?;
+                client.execute(query, params).await.map_err(map_error)
+            }
+            PostgresConnection::PooledClient(client) => {
+                let client = client.lock().await;
+                client.execute(query, params).await.map_err(map_error)
+            }
+        }
+    }
+
+    async fn batch_execute(&self, query: &str) -> Result<()> {
+        match &self.connection {
+            PostgresConnection::Client(client) => {
+                client.batch_execute(query).await.map_err(map_error)
+            }
+            PostgresConnection::Pool(pool) => {
+                let client = pool.get().await.map_err(map_pool_error)?;
+                client.batch_execute(query).await.map_err(map_error)
+            }
+            PostgresConnection::PooledClient(client) => {
+                let client = client.lock().await;
+                client.batch_execute(query).await.map_err(map_error)
+            }
+        }
     }
 
     async fn query_count(
@@ -528,11 +683,7 @@ impl<T: SqlEntity> PostgresRepository<T> {
             format!(" WHERE {}", where_parts.join(" AND "))
         };
         let query = format!("SELECT COUNT(*) FROM {table}{where_clause}");
-        let row = self
-            .client
-            .query_one(&query, owned_refs(params).as_slice())
-            .await
-            .map_err(map_error)?;
+        let row = self.query_one_owned(&query, params).await?;
         let count: i64 = row.get(0);
         Ok(count as u64)
     }
@@ -549,11 +700,7 @@ where
         let query = format!("SELECT * FROM {table} WHERE {primary_key} = $1 LIMIT 1");
         let mut params = Vec::new();
         push_entity_id_param(&mut params, id)?;
-        let row = self
-            .client
-            .query_opt(&query, owned_refs(&params).as_slice())
-            .await
-            .map_err(map_error)?;
+        let row = self.query_opt_owned(&query, &params).await?;
 
         row.map(T::from_row)
             .transpose()?
@@ -578,22 +725,14 @@ where
         let query = format!("SELECT 1 FROM {table} WHERE {primary_key} = $1 LIMIT 1");
         let mut params = Vec::new();
         push_entity_id_param(&mut params, id)?;
-        let row = self
-            .client
-            .query_opt(&query, owned_refs(&params).as_slice())
-            .await
-            .map_err(map_error)?;
+        let row = self.query_opt_owned(&query, &params).await?;
         Ok(row.is_some())
     }
 
     async fn count(&self) -> Result<u64> {
         let table = quote_path(T::table_name())?;
         let query = format!("SELECT COUNT(*) FROM {table}");
-        let row = self
-            .client
-            .query_one(&query, &[])
-            .await
-            .map_err(map_error)?;
+        let row = self.query_one_params(&query, &[]).await?;
         let count: i64 = row.get(0);
         Ok(count as u64)
     }
@@ -637,11 +776,7 @@ where
             )));
         }
         params.push(entity.primary_key_param());
-        let row = self
-            .client
-            .query_one(&query, params.as_slice())
-            .await
-            .map_err(map_error)?;
+        let row = self.query_one_params(&query, params.as_slice()).await?;
         T::from_row(row)
     }
 
@@ -659,11 +794,7 @@ where
         let query = format!("DELETE FROM {table} WHERE {primary_key} = $1");
         let mut params = Vec::new();
         push_entity_id_param(&mut params, id)?;
-        let affected = self
-            .client
-            .execute(&query, owned_refs(&params).as_slice())
-            .await
-            .map_err(map_error)?;
+        let affected = self.execute_owned(&query, &params).await?;
         Ok(affected > 0)
     }
 }
@@ -680,19 +811,31 @@ where
 
         let table = quote_path(T::table_name())?;
         let fields = T::fields();
-        let field_list = quoted_fields(fields)?;
+        let generated_ids = entities.iter().all(|entity| !entity.has_id());
+        if !generated_ids && entities.iter().any(|entity| !entity.has_id()) {
+            return Err(RepositoryError::InvalidData(
+                "insert_many cannot mix entities with and without ids".to_string(),
+            ));
+        }
+        let insert_fields = if generated_ids {
+            update_fields::<T>()?
+        } else {
+            fields.to_vec()
+        };
+        let field_list = quoted_fields(&insert_fields)?;
+        let field_count = insert_fields.len();
         let mut saved = Vec::with_capacity(entities.len());
 
-        for chunk in entities.chunks(chunk_size(fields.len())) {
-            let values_clause = values_clause(fields.len(), chunk.len(), 1);
+        for chunk in entities.chunks(chunk_size(field_count)) {
+            let values_clause = values_clause(field_count, chunk.len(), 1);
             let query =
                 format!("INSERT INTO {table} ({field_list}) VALUES {values_clause} RETURNING *");
-            let params = collect_insert_params::<T>(chunk)?;
-            let rows = self
-                .client
-                .query(&query, params.as_slice())
-                .await
-                .map_err(map_error)?;
+            let params = if generated_ids {
+                collect_update_params::<T>(chunk)?
+            } else {
+                collect_insert_params::<T>(chunk)?
+            };
+            let rows = self.query_params(&query, params.as_slice()).await?;
             saved.extend(
                 rows.into_iter()
                     .map(T::from_row)
@@ -731,11 +874,7 @@ where
                 "UPDATE {table} AS target SET {set_clause} FROM (VALUES {values_clause}) AS source ({source_columns}) WHERE target.{primary_key} = source.{primary_key} RETURNING target.*"
             );
             let params = collect_insert_params::<T>(chunk)?;
-            let rows = self
-                .client
-                .query(&query, params.as_slice())
-                .await
-                .map_err(map_error)?;
+            let rows = self.query_params(&query, params.as_slice()).await?;
             saved.extend(
                 rows.into_iter()
                     .map(T::from_row)
@@ -774,11 +913,7 @@ where
                 "INSERT INTO {table} ({field_list}) VALUES {values_clause} ON CONFLICT ({primary_key}) DO UPDATE SET {update_clause} RETURNING *"
             );
             let params = collect_insert_params::<T>(chunk)?;
-            let rows = self
-                .client
-                .query(&query, params.as_slice())
-                .await
-                .map_err(map_error)?;
+            let rows = self.query_params(&query, params.as_slice()).await?;
             saved.extend(
                 rows.into_iter()
                     .map(T::from_row)
@@ -808,11 +943,7 @@ where
             for id in chunk {
                 push_entity_id_param(&mut params, id)?;
             }
-            affected += self
-                .client
-                .execute(&query, owned_refs(&params).as_slice())
-                .await
-                .map_err(map_error)?;
+            affected += self.execute_owned(&query, &params).await?;
         }
 
         Ok(affected)
@@ -846,10 +977,7 @@ where
         let query = format!("DELETE FROM {table} WHERE {field} = $1");
         let mut params = Vec::new();
         push_entity_id_param(&mut params, value)?;
-        self.client
-            .execute(&query, owned_refs(&params).as_slice())
-            .await
-            .map_err(map_error)
+        self.execute_owned(&query, &params).await
     }
 }
 
@@ -866,85 +994,92 @@ where
 
     async fn insert_graph(&self, aggregate: &A) -> Result<A> {
         let _transaction_guard = self.transaction_lock.lock().await;
-        self.begin_transaction().await?;
+        let tx_repo = self.transaction_repository().await?;
+        tx_repo.begin_transaction().await?;
 
-        let saved = match self.insert(aggregate).await {
+        let saved = match tx_repo.insert(aggregate).await {
             Ok(saved) => saved,
             Err(error) => {
-                self.rollback_transaction().await?;
+                tx_repo.rollback_transaction().await?;
                 return Err(error);
             }
         };
 
-        if let Err(error) = A::insert_relations(self, aggregate).await {
-            self.rollback_transaction().await?;
+        let mut aggregate = aggregate.clone();
+        <A as flux::Entity>::set_id(&mut aggregate, saved.id().clone());
+
+        if let Err(error) = A::insert_relations(&tx_repo, &aggregate).await {
+            tx_repo.rollback_transaction().await?;
             return Err(error);
         }
 
-        self.commit_transaction().await?;
+        tx_repo.commit_transaction().await?;
         self.reload_all_relations(saved.id()).await
     }
 
     async fn update_graph(&self, aggregate: &A, mode: GraphSaveMode) -> Result<A> {
         let _transaction_guard = self.transaction_lock.lock().await;
-        self.begin_transaction().await?;
+        let tx_repo = self.transaction_repository().await?;
+        tx_repo.begin_transaction().await?;
 
-        let saved = match self.update(aggregate).await {
+        let saved = match tx_repo.update(aggregate).await {
             Ok(saved) => saved,
             Err(error) => {
-                self.rollback_transaction().await?;
+                tx_repo.rollback_transaction().await?;
                 return Err(error);
             }
         };
 
-        if let Err(error) = A::update_relations(self, aggregate, mode).await {
-            self.rollback_transaction().await?;
+        if let Err(error) = A::update_relations(&tx_repo, aggregate, mode).await {
+            tx_repo.rollback_transaction().await?;
             return Err(error);
         }
 
-        self.commit_transaction().await?;
+        tx_repo.commit_transaction().await?;
         self.reload_all_relations(saved.id()).await
     }
 
     async fn save_graph(&self, aggregate: &A, mode: GraphSaveMode) -> Result<A> {
         let _transaction_guard = self.transaction_lock.lock().await;
-        self.begin_transaction().await?;
+        let tx_repo = self.transaction_repository().await?;
+        tx_repo.begin_transaction().await?;
 
-        let saved = match self.save(aggregate).await {
+        let saved = match tx_repo.save(aggregate).await {
             Ok(saved) => saved,
             Err(error) => {
-                self.rollback_transaction().await?;
+                tx_repo.rollback_transaction().await?;
                 return Err(error);
             }
         };
 
-        if let Err(error) = A::update_relations(self, aggregate, mode).await {
-            self.rollback_transaction().await?;
+        if let Err(error) = A::update_relations(&tx_repo, aggregate, mode).await {
+            tx_repo.rollback_transaction().await?;
             return Err(error);
         }
 
-        self.commit_transaction().await?;
+        tx_repo.commit_transaction().await?;
         self.reload_all_relations(saved.id()).await
     }
 
     async fn delete_graph(&self, id: &A::Id) -> Result<bool> {
         let _transaction_guard = self.transaction_lock.lock().await;
-        self.begin_transaction().await?;
+        let tx_repo = self.transaction_repository().await?;
+        tx_repo.begin_transaction().await?;
 
-        if let Err(error) = A::delete_relations(self, id).await {
-            self.rollback_transaction().await?;
+        if let Err(error) = A::delete_relations(&tx_repo, id).await {
+            tx_repo.rollback_transaction().await?;
             return Err(error);
         }
 
-        let deleted = match self.delete(id).await {
+        let deleted = match tx_repo.delete(id).await {
             Ok(deleted) => deleted,
             Err(error) => {
-                self.rollback_transaction().await?;
+                tx_repo.rollback_transaction().await?;
                 return Err(error);
             }
         };
 
-        self.commit_transaction().await?;
+        tx_repo.commit_transaction().await?;
         Ok(deleted)
     }
 }
@@ -1052,11 +1187,7 @@ where
         )
     };
 
-    repository
-        .client
-        .execute(&query, owned_refs(&params).as_slice())
-        .await
-        .map_err(map_error)?;
+    repository.execute_owned(&query, &params).await?;
     Ok(())
 }
 
@@ -1074,11 +1205,7 @@ where
     let query = format!("UPDATE {table} SET {field} = NULL WHERE {field} = $1");
     let mut params = Vec::new();
     push_entity_id_param(&mut params, value)?;
-    repository
-        .client
-        .execute(&query, owned_refs(&params).as_slice())
-        .await
-        .map_err(map_error)?;
+    repository.execute_owned(&query, &params).await?;
     Ok(())
 }
 
@@ -1117,6 +1244,22 @@ fn collect_insert_params<T: SqlEntity>(entities: &[T]) -> Result<Vec<&(dyn ToSql
         if entity_params.len() != fields_len {
             return Err(RepositoryError::InvalidData(format!(
                 "expected {fields_len} insert params, got {}",
+                entity_params.len()
+            )));
+        }
+        params.extend(entity_params);
+    }
+    Ok(params)
+}
+
+fn collect_update_params<T: SqlEntity>(entities: &[T]) -> Result<Vec<&(dyn ToSql + Sync)>> {
+    let fields_len = T::fields().len().saturating_sub(1);
+    let mut params = Vec::with_capacity(fields_len * entities.len());
+    for entity in entities {
+        let entity_params = entity.to_update_params();
+        if entity_params.len() != fields_len {
+            return Err(RepositoryError::InvalidData(format!(
+                "expected {fields_len} generated-id insert params, got {}",
                 entity_params.len()
             )));
         }
@@ -1238,5 +1381,9 @@ fn entity_id_to_filter_value<I: EntityId>(id: &I) -> Result<flux::FilterValue> {
 }
 
 fn map_error(error: tokio_postgres::Error) -> RepositoryError {
+    RepositoryError::Backend(error.to_string())
+}
+
+fn map_pool_error(error: deadpool_postgres::PoolError) -> RepositoryError {
     RepositoryError::Backend(error.to_string())
 }

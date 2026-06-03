@@ -2,7 +2,8 @@ use flux::{
     FilterExpr, FilterOp, FilterOperand, FilterValue, GenericFilter, OrderDirection,
     RepositoryError, Result,
 };
-use mongodb::bson::{oid::ObjectId, Bson, Document};
+use mongodb::bson::{oid::ObjectId, Bson, DateTime, Decimal128, Document};
+use std::str::FromStr;
 
 pub struct RenderedFilter {
     pub filter: Document,
@@ -140,6 +141,25 @@ fn to_bson(value: &FilterValue) -> Result<Bson> {
         FilterValue::F64(value) => Ok(Bson::Double(*value)),
         FilterValue::String(value) => Ok(Bson::String(value.clone())),
         FilterValue::Uuid(value) => Ok(Bson::String(value.to_string())),
+        FilterValue::DateTimeUtc(value) => Ok(Bson::DateTime(DateTime::from_millis(
+            value.timestamp_millis(),
+        ))),
+        FilterValue::NaiveDate(value) => {
+            let datetime = value.and_hms_opt(0, 0, 0).ok_or_else(|| {
+                RepositoryError::InvalidData(format!("invalid NaiveDate filter value: {value}"))
+            })?;
+            Ok(Bson::DateTime(DateTime::from_millis(
+                datetime.and_utc().timestamp_millis(),
+            )))
+        }
+        FilterValue::NaiveDateTime(value) => Ok(Bson::DateTime(DateTime::from_millis(
+            value.and_utc().timestamp_millis(),
+        ))),
+        FilterValue::Decimal(value) => Decimal128::from_str(&value.to_string())
+            .map(Bson::Decimal128)
+            .map_err(|error| {
+                RepositoryError::InvalidData(format!("invalid Decimal filter value: {error}"))
+            }),
         FilterValue::Backend { type_name, value } if *type_name == "mongodb.object_id" => {
             let object_id = ObjectId::parse_str(value).map_err(|error| {
                 RepositoryError::InvalidData(format!(
